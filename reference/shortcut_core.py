@@ -68,8 +68,9 @@ class StepConditioning(nn.Module):
             )
         d = self.active_duration
         # The duration branch contributes zero at d=0, including learned biases.
-        extra = self.duration(self.features(d)) - self.duration(
-            self.features(torch.zeros_like(d))
+        dtype = self.duration[0].weight.dtype
+        extra = self.duration(self.features(d).to(dtype)) - self.duration(
+            self.features(torch.zeros_like(d)).to(dtype)
         )
         return result + extra.to(result.dtype)
 
@@ -90,11 +91,13 @@ class SD35Field(nn.Module):
     def forward(self, x, sigma, duration, condition):
         sigma = batch_value(sigma, x)
         duration = batch_value(duration, x)
+        # Cast model inputs only. Keep sigma, cached targets and loss arithmetic FP32.
+        dtype = self.transformer.pos_embed.proj.weight.dtype
         kwargs = {
-            "hidden_states": x,
+            "hidden_states": x.to(dtype),
             "timestep": sigma * self.time_scale,
-            "encoder_hidden_states": condition.tokens,
-            "pooled_projections": condition.pooled,
+            "encoder_hidden_states": condition.tokens.to(dtype),
+            "pooled_projections": condition.pooled.to(dtype),
             "return_dict": False,
         }
         if self.shortcut:
@@ -114,23 +117,24 @@ class LoRALinear(nn.Module):
         self.b = nn.Parameter(torch.zeros(base.out_features, rank, **options))
         nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
         self.scale = alpha / rank
+        self.adapter_strength = 1.0
 
     def forward(self, x):
         original = self.base(x)
+        if self.adapter_strength == 0.0:
+            return original
         delta = F.linear(F.linear(x.float(), self.a), self.b)
-        return original + (self.scale * delta).to(original.dtype)
+        return original + (self.adapter_strength * self.scale * delta).to(
+            original.dtype
+        )
 
 
 def configure_fake_lora(field, *, rank=96, alpha=96):
-    """Load the G snapshot first; create optimizers/DDP/EMA after this function."""
-    if not field.shortcut:
-        raise ValueError("F needs finite-duration conditioning")
-    # Preserve learned G duration weights in FP32 while quantizing only the frozen base.
-    duration_module = field.transformer.time_text_embed.duration
-    duration_state = {
-        name: value.detach().float().clone()
-        for name, value in duration_module.state_dict().items()
-    }
+    """Frozen native TEACHER backbone + trainable LoRA; not a G snapshot."""
+    if field.shortcut:
+        raise ValueError(
+            "F must be the native teacher field, without duration embedding"
+        )
     field.requires_grad_(False).to(dtype=torch.bfloat16)
     names = []
 
@@ -172,9 +176,47 @@ def configure_fake_lora(field, *, rank=96, alpha=96):
     # No LoRA on AdaLN modulation, timestep/text projections, patch/output heads.
     if not names:
         raise ValueError("No SD3 transformer block Linear projections found")
-    duration = field.transformer.time_text_embed.duration.float().requires_grad_(True)
-    duration.load_state_dict(duration_state, strict=True)
     return names
+
+
+def set_fake_strength(raw_task, strength):
+    """Call at target-refresh boundaries; checkpoint the scalar separately."""
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("LoRA strength must lie in [0,1]")
+    for module in raw_task.modules():
+        if isinstance(module, LoRALinear):
+            module.adapter_strength = float(strength)
+
+
+def fake_strength(k_g, *, fade_started_at_g=None, fade_duration=1000):
+    if fade_duration <= 0:
+        raise ValueError("Fade duration must be positive")
+    if fade_started_at_g is None:
+        return 1.0
+    return max(0.0, 1.0 - max(0, k_g - fade_started_at_g) / fade_duration)
+
+
+def main_phase_schedule(k_g, *, fade_started_at_g=None):
+    """Apply a validated fade event BEFORE calling this at a boundary.
+
+    Runtime owns readiness gates and transaction/replay state: a due F update
+    must not execute twice after restart. Strength changes only at target refresh.
+    """
+    if not isinstance(k_g, int) or k_g < 0:
+        raise ValueError("k_g must count successful nonnegative G updates")
+    if fade_started_at_g is not None and (
+        fade_started_at_g < 0 or fade_started_at_g > k_g or fade_started_at_g % 5
+    ):
+        raise ValueError("Fade event must be a completed target-refresh boundary")
+    frozen = fade_started_at_g is not None
+    refresh_k = k_g - k_g % 5
+    return {
+        "fake_update_due": not frozen and k_g % 5 == 0,
+        "target_refresh_due": k_g % 5 == 0,
+        "fake_frozen": frozen,
+        "beta": 0.0 if frozen else 0.01 * min(k_g / 100, 1.0),
+        "lora_strength": fake_strength(refresh_k, fade_started_at_g=fade_started_at_g),
+    }
 
 
 class AdapterEMA:
@@ -205,7 +247,7 @@ class AdapterEMA:
         from torch.func import functional_call
 
         # No dropout, mutable normalization statistics or concurrent use of raw_task.
-        # Frozen base parameters remain identical, adapters/step embedding are replaced.
+        # Frozen base parameters remain identical; only LoRA tensors are replaced.
         return functional_call(self.model, self.shadow, args, kwargs, strict=False)
 
 
@@ -229,23 +271,55 @@ def sample_shortcuts(model, noise, condition, *, steps=1):
     return state
 
 
-@torch.no_grad()
-def teacher_cfg(teacher, x, sigma, condition, negative, guidance):
-    conditional = teacher(x, sigma, 0.0, condition)
-    unconditional = teacher(x, sigma, 0.0, negative)
+def guided_velocity(field, x, sigma, condition, negative, guidance):
+    """Supervise F's COMBINED guided field, not conditional field before CFG."""
+    combined = Condition(
+        torch.cat((negative.tokens, condition.tokens)),
+        torch.cat((negative.pooled, condition.pooled)),
+    )
+    predictions = field(
+        torch.cat((x, x)), batch_value(sigma, x).repeat(2), 0.0, combined
+    )
+    unconditional, conditional = predictions.chunk(2)
     return unconditional + guidance * (conditional - unconditional)
 
 
 @torch.no_grad()
-def teacher_rollout(teacher, noise, condition, negative, *, steps=32, guidance=4.5):
-    if steps < 2 or steps & (steps - 1):
-        raise ValueError("Use a power-of-two uniform-sigma teacher grid")
+def teacher_cfg(teacher, x, sigma, condition, negative, guidance):
+    return guided_velocity(teacher, x, sigma, condition, negative, guidance)
+
+
+@torch.no_grad()
+def native_teacher_sigmas(scheduler, transformer, device, *, resolution=512, steps=50):
+    """Construct the pinned SD3 pipeline's resolution-aware native Euler schedule."""
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+        calculate_shift,
+    )
+
+    config = dict(scheduler.config)
+    kwargs = {}
+    if config.get("use_dynamic_shifting", False):
+        side = resolution // 8 // transformer.config.patch_size
+        kwargs["mu"] = calculate_shift(
+            side * side,
+            config.get("base_image_seq_len", 256),
+            config.get("max_image_seq_len", 4096),
+            config.get("base_shift", 0.5),
+            config.get("max_shift", 1.16),
+        )
+    scheduler.set_timesteps(steps, device=device, **kwargs)
+    return scheduler.sigmas.detach().to(device=device, dtype=torch.float32).clone()
+
+
+@torch.no_grad()
+def teacher_rollout(teacher, noise, condition, negative, sigmas, *, guidance=4.5):
+    """Native FlowMatch Euler grid; validate 51 physical nodes for 50 steps."""
     x = noise.float()
     states = [x.cpu()]
-    for index in range(steps):
-        sigma = 1.0 - index / steps
+    for index in range(len(sigmas) - 1):
+        sigma = sigmas[index]
         velocity = teacher_cfg(teacher, x, sigma, condition, negative, guidance)
-        x = x - velocity / steps
+        x = x - (sigma - sigmas[index + 1]) * velocity
         states.append(x.cpu())
     # Keep states FP32: subtracting nearby BF16 states corrupts small-duration targets.
     return torch.stack(states, dim=1)
@@ -253,7 +327,7 @@ def teacher_rollout(teacher, noise, condition, negative, *, steps=32, guidance=4
 
 def draw_dyadic(count, device, generator, *, levels=5, full_step_probability=None):
     if full_step_probability is None:
-        # F retains its uniform hierarchy, including d=1.
+        # Uniform hierarchy when no full-interval probability is requested.
         exponent = torch.randint(
             levels + 1, (count,), device=device, generator=generator
         )
@@ -288,53 +362,165 @@ def shortcut_target(
 
 
 @torch.no_grad()
-def local_rollout(model, x, sigma, duration, condition, *, steps=32):
-    """Diagnostic reference: many small Euler steps of the SAME raw local field."""
-    sigma = batch_value(sigma, x)
-    step = batch_value(duration, x) / steps
-    state = x.float()
-    for index in range(steps):
-        velocity = model(state, sigma - index * step, 0.0, condition)
-        state = state - coefficients(step, state) * velocity
-    return state
+def local_fake_bridge(
+    ema_f,
+    x,
+    sigma,
+    duration,
+    condition,
+    negative,
+    *,
+    guidance=4.5,
+    max_step=1 / 16,
+    min_substeps=2,
+    enabled=None,
+):
+    """Integrate instantaneous EMA-F across the FIRST HALF of a G interval."""
+    half = duration / 2
+    counts = torch.ceil(half / max_step).long().clamp_min(min_substeps)
+    if enabled is not None:
+        counts = torch.where(enabled, counts, 0)
+    step = half / counts.clamp_min(1).float()
+    state = x.float().clone()
+    # Native d<=1, so at most eight F evaluations per sample at max_step=1/16.
+    bound = max(min_substeps, math.ceil(0.5 / max_step))
+    for index in range(bound):
+        active = torch.nonzero(counts > index, as_tuple=True)[0]
+        if active.numel() == 0:
+            continue
+        velocity = guided_velocity(
+            ema_f,
+            state[active],
+            sigma[active] - index * step[active],
+            condition.take(active),
+            negative.take(active),
+            guidance,
+        )
+        state[active] = (
+            state[active] - coefficients(step[active], state[active]) * velocity
+        )
+    # Only raw F/AdapterEMA calls here: no DDP/FSDP collectives in rank-local loops.
+    return state.detach(), counts.detach()
+
+
+@torch.no_grad()
+def generator_bootstrap_target(
+    ema_g,
+    ema_f,
+    x,
+    sigma,
+    duration,
+    condition,
+    negative,
+    *,
+    source,
+    minimum_duration=1 / 32,
+    bridge_max_step=1 / 16,
+    bridge_min_substeps=2,
+    guidance=4.5,
+    enabled=None,
+):
+    if source == "ema_g_self":
+        return shortcut_target(
+            ema_g, x, sigma, duration, condition, minimum_duration=minimum_duration
+        ), torch.zeros_like(duration, dtype=torch.long)
+    if source != "ema_f_local_then_ema_g":
+        raise ValueError(f"Unsupported bootstrap target: {source}")
+    # Runtime validates the source whitelist before collective forward.
+    midpoint, counts = local_fake_bridge(
+        ema_f,
+        x,
+        sigma,
+        duration,
+        condition,
+        negative,
+        guidance=guidance,
+        max_step=bridge_max_step,
+        min_substeps=bridge_min_substeps,
+        enabled=enabled,
+    )
+    half = duration / 2
+    child = torch.where(duration <= minimum_duration + 1e-7, 0.0, half)
+    # Exactly one EMA-G tail call on EVERY rank, even with different local F counts.
+    endpoint = midpoint - coefficients(half, midpoint) * ema_g(
+        midpoint, sigma - half, child, condition
+    )
+    return ((x.float() - endpoint) / coefficients(duration, x)).detach(), counts
+
+
+def interpolate_cached_states(states, sigmas, query):
+    """FP32 piecewise-linear interpolation of a native, nonuniform teacher cache."""
+    edge = torch.searchsorted(-sigmas.contiguous(), -query.contiguous(), right=True) - 1
+    edge = edge.clamp(0, len(sigmas) - 2)
+    row = torch.arange(states.shape[0], device=states.device)
+    fraction = (sigmas[edge] - query) / (sigmas[edge] - sigmas[edge + 1])
+    start, end = states[row, edge].float(), states[row, edge + 1].float()
+    return start + coefficients(fraction, start) * (end - start)
+
+
+def target_kinds(
+    count, device, generator, *, full_probability=0.25, local_probability=0.25
+):
+    """Exact row counts per microbatch; runtime validates divisibility before collectives."""
+    full_count = float(count * full_probability)
+    local_count = float(count * local_probability)
+    if (
+        full_probability < 0
+        or local_probability < 0
+        or full_probability + local_probability > 1
+        or not full_count.is_integer()
+        or not local_count.is_integer()
+    ):
+        raise ValueError("Target fractions must produce exact integer row counts")
+    order = torch.randperm(count, device=device, generator=generator)
+    full = order < int(full_count)
+    local = (order >= int(full_count)) & (order < int(full_count + local_count))
+    return full, local
 
 
 def cached_teacher_batch(
-    states, generator, *, full_step_probability=0.5, local_probability=0.25
+    states,
+    sigmas,
+    generator,
+    *,
+    full_step_probability=0.25,
+    local_probability=0.25,
+    levels=5,
 ):
-    """states [B,M+1,C,H,W], generated by teacher_rollout. Return x,sigma,d,target."""
+    """Native 50-step states + sigma nodes -> local/finite/full G labels."""
     b, points = states.shape[:2]
-    steps = points - 1
-    if steps < 2 or steps & (steps - 1):
-        raise ValueError("Cache grid must have a power-of-two step count")
-    levels = int(math.log2(steps))
-    exponent = torch.randint(levels, (b,), device=states.device, generator=generator)
-    span = 2**exponent
-    kind = torch.rand(b, device=states.device, generator=generator)
-    full = kind < full_step_probability
-    local = (kind >= full_step_probability) & (
-        kind < full_step_probability + local_probability
+    sigma, duration = draw_dyadic(
+        b, states.device, generator, levels=levels, full_step_probability=0.0
     )
-    span = torch.where(full, steps, torch.where(local, 1, span))
-    slot = (
-        torch.rand(b, device=states.device, generator=generator) * (steps // span)
-    ).long()
-    start = slot * span
+    full, local = target_kinds(
+        b,
+        states.device,
+        generator,
+        full_probability=full_step_probability,
+        local_probability=local_probability,
+    )
+    sigma = torch.where(full, 1.0, sigma)
+    duration = torch.where(full, 1.0, duration)
+    x = interpolate_cached_states(states, sigmas, sigma)
+    endpoint = interpolate_cached_states(states, sigmas, sigma - duration)
+    target = (x - endpoint) / coefficients(duration, x)
+    # Local labels use actual native vertices/edges, avoiding interpolated local states.
+    edge = torch.randint(points - 1, (b,), device=states.device, generator=generator)
     row = torch.arange(b, device=states.device)
-    x = states[row, start].float()
-    endpoint = states[row, start + span].float()
-    physical_duration = span.float() / steps
-    target = (x - endpoint) / coefficients(physical_duration, x)
-    sigma = 1.0 - start.float() / steps
-    duration = torch.where(local, 0.0, physical_duration)
-    # For d=0 the first Euler edge is the teacher's local velocity at the saved state.
+    local_x = states[row, edge].float()
+    local_target = (local_x - states[row, edge + 1].float()) / coefficients(
+        sigmas[edge] - sigmas[edge + 1], local_x
+    )
+    mask = local.reshape(-1, *([1] * (x.ndim - 1)))
+    x, target = torch.where(mask, local_x, x), torch.where(mask, local_target, target)
+    sigma = torch.where(local, sigmas[edge], sigma)
+    duration = torch.where(local, 0.0, duration)
     return x, sigma, duration, target.detach()
 
 
 @torch.no_grad()
 def fake_targets(
     g,
-    ema_f,
     teacher,
     noise,
     independent_noise,
@@ -344,156 +530,125 @@ def fake_targets(
     *,
     beta,
     guidance=4.5,
-    levels=5,
 ):
-    """3/4 local student-tracking CFM + 1/4 raw-F shortcut targets."""
+    """All samples train instantaneous F on the current one-step G distribution."""
     b = noise.shape[0]
-    if b % 4:
-        raise ValueError("Physical batch must be divisible by four")
-    local_count = 3 * b // 4
     y = one_step(g, noise, condition).detach()
     sigma = torch.rand(b, device=y.device, generator=generator)
     duration = torch.zeros_like(sigma)
-    sigma[local_count:], duration[local_count:] = draw_dyadic(
-        b - local_count, y.device, generator, levels=levels
-    )
     x = (1 - coefficients(sigma, y)) * y + coefficients(sigma, y) * independent_noise
     target = independent_noise.float() - y
     if beta > 0:
-        selection = slice(0, local_count)
-        anchor = teacher_cfg(
-            teacher,
-            x[selection],
-            sigma[selection],
-            condition.take(selection),
-            negative.take(selection),
-            guidance,
-        )
-        target[selection] = (target[selection] + beta * anchor) / (1 + beta)
-    selection = slice(local_count, b)
-    target[selection] = shortcut_target(
-        ema_f,
-        x[selection],
-        sigma[selection],
-        duration[selection],
-        condition.take(selection),
-        minimum_duration=2.0 ** (-levels),
-    )
+        anchor = teacher_cfg(teacher, x, sigma, condition, negative, guidance)
+        target = (target + beta * anchor) / (1 + beta)
     return x.detach(), sigma, duration, target.detach()
 
 
-def fake_loss(f, training_batch, condition):
+def fake_loss(f, training_batch, condition, negative, *, guidance=4.5):
     x, sigma, duration, target = training_batch
-    prediction = f(x, sigma, duration, condition)
-    local_count = 3 * x.shape[0] // 4
+    prediction = guided_velocity(f, x, sigma, condition, negative, guidance)
     loss = 0.5 * F.mse_loss(prediction, target)
     return loss, {
-        "local_mse": F.mse_loss(
-            prediction[:local_count], target[:local_count]
-        ).detach(),
-        "shortcut_mse": F.mse_loss(
-            prediction[local_count:], target[local_count:]
-        ).detach(),
+        "local_mse": F.mse_loss(prediction, target).detach(),
     }
 
 
-def dmd_proxy(
-    generated, fake_velocity, teacher_velocity, noisy, sigma, *, beta, floor=1e-3
-):
-    with torch.no_grad():
-        corrected = (1 + beta) * fake_velocity - beta * teacher_velocity
-        teacher_clean = noisy - coefficients(sigma, noisy) * teacher_velocity
-        dimensions = tuple(range(1, generated.ndim))
-        normalization = (
-            (generated.detach() - teacher_clean).abs().mean(dimensions).clamp_min(floor)
-        )
-        gradient = coefficients(sigma, generated) * (teacher_velocity - corrected)
-        gradient = gradient / coefficients(normalization, generated)
-    # Check finiteness collectively after every rank finishes forward.
-    # A rank-local exception here could deadlock later FSDP collectives.
-    proxy = 0.5 * F.mse_loss(generated, (generated - gradient).detach())
-    return proxy, gradient.detach()
-
-
-def generator_losses(
+@torch.no_grad()
+def student_target_batch(
     g,
-    f,
-    target_model,
-    teacher,
+    ema_g,
+    ema_f,
     noise,
     independent_noise,
     condition,
     negative,
-    teacher_states,
-    teacher_condition,
     generator,
     *,
-    beta,
-    guidance=4.5,
+    source,
     levels=5,
-    teacher_weight=0.25,
-    shortcut_weight=0.25,
-    dmd_weight=1.0,
-    teacher_full_step_probability=0.5,
-    teacher_local_probability=0.25,
-    bootstrap_full_step_probability=0.5,
+    full_probability=0.25,
+    local_probability=0.25,
+    guidance=4.5,
+    bridge_max_step=1 / 16,
+    bridge_min_substeps=2,
 ):
+    """Refresh detached labels once per five G updates; no direct teacher call."""
     b = noise.shape[0]
-    if b % 4:
-        raise ValueError("Physical batch must be divisible by four")
-    generated = one_step(g, noise, condition)
-    sigma = 0.02 + 0.96 * torch.rand(b, device=noise.device, generator=generator)
-    noisy = (1 - coefficients(sigma, generated)) * generated.detach()
-    noisy = noisy + coefficients(sigma, generated) * independent_noise
-    with torch.no_grad():
-        fv = f(noisy, sigma, 0.0, condition)
-        tv = teacher_cfg(teacher, noisy, sigma, condition, negative, guidance)
-    direct, direction = dmd_proxy(generated, fv, tv, noisy, sigma, beta=beta)
-
-    n = b // 4
-    # Independent cached-anchor batch: do not restrict on-policy prompts to cache ids.
-    # Runtime validates n rows and matching ids in teacher_states/teacher_condition.
-    tx, ts, td, target = cached_teacher_batch(
-        teacher_states,
-        generator,
-        full_step_probability=teacher_full_step_probability,
-        local_probability=teacher_local_probability,
+    generated = one_step(g, noise, condition).detach()
+    sigma, duration = draw_dyadic(
+        b, noise.device, generator, levels=levels, full_step_probability=0.0
     )
-    teacher_loss = 0.5 * F.mse_loss(g(tx, ts, td, teacher_condition), target)
-
-    selection = slice(b - n, b)
-    bs, bd = draw_dyadic(
-        n,
+    full, local = target_kinds(
+        b,
         noise.device,
         generator,
-        levels=levels,
-        full_step_probability=bootstrap_full_step_probability,
+        full_probability=full_probability,
+        local_probability=local_probability,
     )
-    by = generated[selection].detach()
-    bx = (1 - coefficients(bs, by)) * by + coefficients(bs, by) * independent_noise[
-        selection
-    ]
-    bc = condition.take(selection)
-    target = shortcut_target(
-        target_model, bx, bs, bd, bc, minimum_duration=2.0 ** (-levels)
+    sigma, duration = torch.where(full, 1.0, sigma), torch.where(full, 1.0, duration)
+    x = (1 - coefficients(sigma, generated)) * generated
+    x = x + coefficients(sigma, generated) * independent_noise
+    # Collective EMA-G calls cover ALL rows on every rank. Local rows use dummy
+    # finite inputs until their labels are replaced below; never branch FSDP on ids.
+    target, bridge_counts = generator_bootstrap_target(
+        ema_g,
+        ema_f,
+        x,
+        sigma,
+        duration,
+        condition,
+        negative,
+        source=source,
+        minimum_duration=2.0 ** (-levels),
+        bridge_max_step=bridge_max_step,
+        bridge_min_substeps=bridge_min_substeps,
+        guidance=guidance,
+        enabled=~local,
     )
-    bootstrap = 0.5 * F.mse_loss(g(bx.detach(), bs, bd, bc), target)
-    total = (
-        dmd_weight * direct
-        + teacher_weight * teacher_loss
-        + shortcut_weight * bootstrap
+    ids = torch.nonzero(local, as_tuple=True)[0]
+    local_sigma = torch.rand(ids.numel(), device=x.device, generator=generator)
+    local_x = (1 - coefficients(local_sigma, generated[ids])) * generated[ids]
+    local_x = (
+        local_x + coefficients(local_sigma, generated[ids]) * independent_noise[ids]
     )
-    return total, {
-        "direct": direct.detach(),
-        "teacher_trajectory": teacher_loss.detach(),
-        "shortcut": bootstrap.detach(),
-        "dmd_direction_rms": direction.square().mean().sqrt(),
-        "dmd_direction_finite": torch.isfinite(direction).all(),
-        "generated_mean": generated.detach().mean(),
-        "generated_std": generated.detach().std(),
-        "teacher_full_step_fraction": (td == 1.0).float().mean().detach(),
-        "bootstrap_full_step_fraction": (bd == 1.0).float().mean().detach(),
+    # Raw AdapterEMA has no collectives. Exactly 25% local rows at the default b=8.
+    if ids.numel():
+        local_target = guided_velocity(
+            ema_f,
+            local_x,
+            local_sigma,
+            condition.take(ids),
+            negative.take(ids),
+            guidance,
+        )
+        x[ids], sigma[ids], duration[ids], target[ids] = (
+            local_x,
+            local_sigma,
+            0.0,
+            local_target,
+        )
+    return (x.detach(), sigma.detach(), duration.detach(), target.detach()), {
+        "full_rows": full.sum(),
+        "local_rows": local.sum(),
+        "short_rows": (~full & ~local).sum(),
+        "bridge_f_sample_evaluations": bridge_counts.sum(),
+        "generated_mean": generated.mean(),
+        "generated_std": generated.std(),
     }
+
+
+def student_loss(g, training_batch, condition):
+    """One differentiable G field call against cached, detached mixed targets."""
+    x, sigma, duration, target = training_batch
+    prediction = g(x, sigma, duration, condition)
+    row_mse = (prediction - target).square().flatten(1).mean(1)
+    full, local = duration == 1.0, duration == 0.0
+    statistics = {}
+    for name, mask in (("full", full), ("local", local), ("short", ~full & ~local)):
+        # Runtime all-reduces sums/counts; never average an empty subset.
+        statistics[name + "_mse_sum"] = row_mse[mask].detach().sum()
+        statistics[name + "_rows"] = mask.sum()
+    return 0.5 * row_mse.mean(), statistics
 
 
 class FieldTask(nn.Module):
@@ -518,8 +673,9 @@ class FieldTask(nn.Module):
         if operation == "g_warmup":
             x, sigma, duration, target = cached_teacher_batch(
                 kwargs["teacher_states"],
+                kwargs["teacher_sigmas"],
                 kwargs["generator"],
-                full_step_probability=kwargs.get("full_step_probability", 0.5),
+                full_step_probability=kwargs.get("full_step_probability", 0.25),
                 local_probability=kwargs.get("local_probability", 0.25),
             )
             loss = 0.5 * F.mse_loss(self.field(x, sigma, duration, condition), target)
@@ -528,9 +684,15 @@ class FieldTask(nn.Module):
                 "teacher_full_step_fraction": (duration == 1.0).float().mean(),
             }
         if operation == "f_loss":
-            return fake_loss(self.field, kwargs["training_batch"], condition)
+            return fake_loss(
+                self.field,
+                kwargs["training_batch"],
+                condition,
+                kwargs["negative"],
+                guidance=kwargs.get("guidance", 4.5),
+            )
         if operation == "g_loss":
-            return generator_losses(self.field, condition=condition, **kwargs)
+            return student_loss(self.field, kwargs["training_batch"], condition)
         raise ValueError(f"Unknown operation: {operation}")
 
 
@@ -570,6 +732,8 @@ def wrap_fsdp(model, device, *, forward_prefetch=False):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
+            cast_forward_inputs=False,
+            cast_root_forward_inputs=False,
         ),
         use_orig_params=False,
         limit_all_gathers=True,

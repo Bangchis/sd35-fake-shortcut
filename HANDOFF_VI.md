@@ -1,74 +1,69 @@
-# SD3.5 Medium → 1-step: shortcut generator + student-tracking shortcut fake
+# SD3.5 Medium: student distill slow fake, shortcut và LoRA fade
 
-Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v2_onestep`.
+Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v3_slow_fake`.
 
-Đây là **bản bàn giao thiết kế + code lõi để bên nhận triển khai**, theo yêu cầu mới
-của chủ repo. **Dự án mới độc lập `sd35-fake-shortcut`, package `sd35_shortcut`**:
-viết mới toàn bộ, không import/copy/reuse code, launcher, config hay checkpoint
-runtime của dự án SDXL cũ. Các entrypoint ở cuối file là contract cần viết,
-không phải lệnh hiện đã tồn tại. Code
-Python trong file đã được rà soát tĩnh, chưa import Torch/chạy tests/GPU/training.
+**Một project mới độc lập**, native **512×512**, checkpoint SD3.5 Medium **base nhiều
+bước** dạng Diffusers local, captions **reLAION đã có**, global batch **64**.
+Đây là thiết kế và reference kernels để bên nhận triển khai runtime; chưa phải
+trainer chạy được, checkpoint/result handoff hoặc kết quả đã verify trên H100.
+Không copy/import bất kỳ code, launcher, config hay utilities từ project cũ.
 
-Yêu cầu chốt: **native 512×512**, captions từ **reLAION local bên nhận đã có**,
-checkpoint SD3.5 Medium **base nhiều bước, thư mục Diffusers** bên
-nhận đã có; G inference một bước; G và F đều có step-size conditioning; F phải
-warm-up để theo phân phối student trước khi cung cấp trajectory targets. Batch
-hiệu dụng **64**. G LR **5e-6 full-weight**; F LR **2.5e-5 LoRA rank96** theo chốt
-cuối của chủ repo. Metrics dùng implementation có sẵn bên nhận qua plugin mới;
-không đưa code training cũ vào project này. File là design + reference kernels,
-chưa phải trainer hoàn chỉnh hoặc bằng chứng phương pháp đã thành công.
+## 1. Câu hỏi thí nghiệm và những điểm chốt
 
-## 1. Quyết định thí nghiệm và điều nó kiểm chứng
+**G học từ F trong main phase. F học vận tốc tức thời trên phân phối ảnh một bước
+của G, đổi chậm; sau khi ổn định, giảm LoRA dần để F trở về teacher.** Chỉ G có
+conditioning độ dài shortcut; F không học shortcut và không có duration MLP.
 
-Giả thuyết cần kiểm tra: **khi generator đang thay đổi, dùng một fake field theo
-phân phối generator và đã học các shortcut hữu hạn để tạo target cho G có tốt hơn
-G tự tạo shortcut targets bằng EMA-G không?** Teacher ảnh hưởng F qua một local
-anchor nhỏ; F ảnh hưởng G qua cả DMD và shortcut trajectory.
+- T: SD3.5 Medium base frozen, CFG 4.5. Sinh cache bằng **50 denoising steps**.
+- G: full-weight SD3.5 + duration conditioning, LR **5e-6**, ảnh chính bằng
+  **1 conditional NFE**, không external CFG. Few-step 2/4/8 chỉ diagnostic.
+- F: **backbone T cố định** + LoRA rank/alpha **96**, LR **2.5e-5**;
+  học **combined CFG field** với CFG 4.5, không phải học conditional velocity rồi
+  áp CFG thêm sau đó. Khi LoRA strength λ=0, F bằng T_CFG 4.5 theo cùng numerical path.
+- Main: không DMD, không teacher trajectory loss trực tiếp vào G. Teacher đi vào
+  F qua target anchor nhỏ β≤0.01; teacher dùng riêng ở P0/cache/evaluation.
+- F warm-up trên ảnh one-step của G trước. Sau đó F update **1 lần / 5 G updates**;
+  EMA-F làm target. Đó là cadence chậm, chưa đảm bảo field drift nhỏ: phải đo.
+- Target G refresh mỗi **5 successful G updates**, giữ detached để replay 5 lần.
+  Giảm target-generation cost, không giảm số G forward/backward hoặc giấu staleness.
 
-Chạy hai nhánh từ **cùng một checkpoint sau G bootstrap + F warm-up**:
+**Matched A/B**, chỉ đổi cách tạo target finite shortcut:
 
-| Nhánh | DMD vào G | F training | Target cho shortcut của G |
-|---|---|---|---|
-| A — self shortcut | corrected F + teacher, giống B | giống B | hai half-shortcuts của EMA-G |
-| B — fake bridge | corrected F + teacher, giống A | giống A | hai half-shortcuts của EMA-F |
+| Nhánh | Local 25% của G | Finite target 75% của G |
+|---|---|---|
+| A — self control | distill EMA-F velocity | EMA-G đi hai half-shortcuts |
+| B — proposed bridge | distill EMA-F velocity | EMA-F đi các Euler bước nhỏ qua nửa đầu; EMA-G shortcut nửa cuối |
 
-**Chỉ khác `g_shortcut_target_source: ema_g / ema_f`.** Cùng architecture, tham số
-trainable, khởi tạo, cache, prompts, batch 64, LR, EMA decay, beta, loss weights,
-số G/F updates và cách eval. Cả A lẫn B vẫn có F và DMD; không gọi A là bản tái lập
-Shortcut Models thuần hoặc Decoupled DMD. Việc giữ F ở A làm công bằng cả nhánh DMD
-lẫn chi phí; không so B với một baseline đã bỏ bớt losses hoặc train ít hơn.
+75% finite gồm **25% full d=1 + 50% shorter intervals**; toàn batch còn **25% d=0**.
+Default microbatch chia hết cho4 ⇒ global 64 có **16 full / 16 local / 32 short**,
+không chỉ xác suất kỳ vọng. A cũng có F local supervision, cùng warm-up, cadence,
+β, fade, data, optimizer, EMA, target replay, successful G updates và evaluation.
+A không phải reproduction Shortcut Models thuần. B dùng thêm F evaluations;
+ngang updates không đồng nghĩa ngang compute, phải báo GPU-giờ/NFE thực tế.
 
-Đây là kiểm tra nhân quả **hẹp nhưng rõ** của nguồn trajectory target. Nó không
-tự tách hiệu quả riêng của beta. Nếu B có lợi, ablation kế tiếp mới là B với
-`beta=0`; không mở sweep nhiều chiều ngay từ đầu. So với checkpoint khởi tạo cũng
-được báo, nhưng không dùng riêng phép so đó để kết luận fake bridge hiệu quả.
+**Fade:** giữ λ=1 ít nhất 200 successful main G updates, qua readiness gate;
+sau đó **đóng băng cả online adapters và EMA-F snapshot**, giảm λ tuyến tính
+1→0 trong **1.000 G updates**. Không để F tiếp tục tăng adapters bù λ giảm.
+λ là scale của LoRA ở từng layer, **không phải tỷ lệ mixture teacher/student trong
+output**; λ→0 bảo đảm về backbone teacher, nhưng khoảng cách field không nhất
+thiết giảm đơn điệu. EMA-F cũng phải dùng đúng λ, không chỉ online F.
 
-### 1.1 One-step là mục tiêu chính, few-step là khả năng phụ
+Pilot 300G/arm, nếu fade bắt đầu tại200, kết thúc ở λ=0.9. Pilot trả lời bridge
+có tín hiệu sớm không và hệ thống có ổn không; **chưa kiểm chứng toàn bộ fade**.
+Muốn test λ=0 cần tiếp tục cả A/B tới1200G với policy đã khóa. Không mặc định
+200G là “đã hội tụ”; nếu gate chưa đạt, dừng screening và báo, không tự đổi lịch
+chỉ một arm. Để tách riêng lợi ích fade, một thí nghiệm sau phải so B-fade với
+B-hold λ=1, cùng freeze event; A/B này chỉ isolate bridge dưới cùng fade policy.
 
-G phải hỗ trợ và được train trực tiếp để sinh ảnh bằng **1 conditional transformer
-evaluation**: `y_G=z-S_G(z, sigma=1, d=1, c)`. F warm-up/tracking và DMD luôn dùng
-endpoint one-step này. Không thay nó bằng endpoint2/4 steps trong training chính.
+Logic cần nói rõ: khi F chỉ khớp phân phối hiện tại của G rồi G học lại F, hệ này
+có thể chủ yếu giữ nguyên phân phối student. **Không có bảo đảm cải thiện ảnh chỉ
+nhờ tracking/shortcut loss giảm.** Nguồn hướng về teacher là anchor nhỏ và nhất
+là LoRA fade; phải đo one-step quality khi fade diễn ra. Trước fade, A/B chỉ kiểm
+tra lợi ích finite target route, chưa chứng minh chất lượng vượt teacher/baseline.
 
-G teacher bootstrap: tỷ lệ lấy mẫu kỳ vọng **50% full interval d=1**, 25% local
-d=0, 25% finite intervals ngắn hơn. Full teacher label chính là `z-y_teacher`,
-nên velocity MSE ởd=1 tương đương endpoint MSE của ảnh one-step trong latent space.
-Common teacher anchor của P2 giữ cùng phân phối này.
-
-G shortcut bootstrap P2: **50% full interval (sigma=1,d=1)**, 50% shorter dyadic
-intervals. Với full interval, input là fresh Gaussian noise; target gồm hai
-half-shortcuts d=1/2 từ EMA-G ởA hoặc EMA-F ởB. G chỉ chạy **một** full shortcut
-để khớp target hai bước đã detach. Không cần thêm differentiable forwards so với
-loss hiện có; đổi tỷ lệ sampling để ưu tiên output one-step.
-
-Inference2/4/8 steps dùng cùng G với d=1/N và sigma giảm1/N mỗi lần, không train
-một generator khác. Đây là diagnostic trên16 validation prompts; primary held-out
-test1024 images và paper-comparable export/eval dùng **1NFE**. Ảnh4 steps tốt mà
-1 step còn noise/collapse thì **chưa đạt mục tiêu**, phải ghi rõ và sửa/đào tạo tiếp.
-Cho phép gọi1 step không tự chứng minh1-step quality; gates/metrics phải đo nó.
-
-Revisionv2 đổi sampling và acceptance contract của G theo yêu cầu ưu tiên one-step;
-không đổi LR, batch, F warm-up/hierarchy hay nguồn target A/B. Cả hai nhánh phải
-được fork lại từ shared initialization của cùng revision/config, không trộn v1/v2.
+Revision này thay v2/v3 draft cũ: bỏ F-shortcut, F backbone copy từ G, DMD và
+teacher loss trực tiếp trong main; full target25%; teacher cache50; slow F và
+fade có freeze. **Không resume state của thuật toán cũ** vào revision này.
 
 ## 2. Đã đọc setting FD-loss, nhưng không bê nguyên sang đây
 
@@ -102,47 +97,51 @@ FID SD3.5 trên COCO. Muốn so với checkpoint FD-loss phải có đúng check
 đo lại cùng prompts/resolution/evaluator. Không dùng mốc SDXL 17.80 để tuyên bố
 SD3.5-512 thắng paper.
 
-## 3. Config đã chọn cho screening
+## 3. Config đã chốt
 
-Các trường bên dưới là schema của project **mới cần triển khai**. Không phụ thuộc
-schema hay package ở repo cũ. Đây là cấu hình đề xuất có lý do, chưa phải
-setting đã chạy thành công hoặc bảo đảm đủ để có ảnh một bước tốt.
+Schema dưới đây cần runtime mới triển khai. Đường dẫn là placeholder phải map
+trên máy bên nhận. Batch/GPU và bộ nhớ cần profile H100, chưa có số đo ở Mac.
 
 ```yaml
-scientific_id: sd35_fake_shortcut_512_relaion_v2_onestep
+scientific_id: sd35_fake_shortcut_512_relaion_v3_slow_fake
 backbone_path: /ABS/PATH/TO/SD35_MEDIUM_DIFFUSERS
 backbone_kind: sd35_medium_base
 local_files_only: true
-generator_train_mode: full_weight
-fake_train_mode: lora
-fake_lora_rank: 96
-fake_lora_alpha: 96
-fake_lora_dropout: 0.0
-fake_lora_targets: mmdit_joint_dual_attention_and_ff_excluding_unused_context_query
-fake_step_embedding_trainable: true
 resolution: 512
 latent_channels: 16
 prompts_source: local_relaion
 prompts_path: /ABS/PATH/TO/RELAION_CAPTIONS
-prompt_format: auto  # explicit jsonl/parquet/csv khi format không xác định được
-prompt_text_column: caption  # bên nhận map tên cột thật, không mặc định có cột này
+prompt_format: auto
+prompt_text_column: caption  # map tên cột thật; không giả định dataset có cột này
 training_prompt_limit: 8192
 validation_prompt_count: 128
 test_prompt_count: 512
 prompt_split_seed: 10
 text_max_sequence_length: 256
 teacher_cfg: 4.5
-teacher_grid: uniform_physical_sigma
-teacher_cache_steps: 32
+fake_cfg: 4.5
+teacher_grid: native_flowmatch_schedule
+teacher_cache_steps: 50
+teacher_cfg_arithmetic_dtype: float32
+teacher_euler_state_dtype: float32
 teacher_cache_train_count: 512
 teacher_cache_validation_count: 128
-minimum_shortcut_duration: 0.03125  # 1/32, không phải một DDPM index
 student_external_cfg: 1.0
 primary_inference_steps: 1
 primary_evaluation_steps: 1
 diagnostic_inference_steps: [2, 4, 8]
 diagnostic_prompt_count: 16
+minimum_shortcut_duration: 0.03125
 
+generator_train_mode: full_weight
+fake_train_mode: lora
+fake_backbone_source: frozen_teacher
+fake_field_kind: instantaneous_velocity
+fake_step_embedding_trainable: false
+fake_lora_rank: 96
+fake_lora_alpha: 96
+fake_lora_dropout: 0.0
+fake_lora_targets: mmdit_joint_dual_attention_and_ff_excluding_unused_context_query
 world_size: 4
 per_device_batch_size: 8
 gradient_accumulation_steps: 2
@@ -167,26 +166,38 @@ adam_betas: [0.9, 0.999]
 weight_decay: 0.01
 max_grad_norm: 10.0
 lr_schedule: constant_with_linear_warmup
-lr_warmup_updates: 20  # mỗi phase bắt đầu optimizer mới
+lr_warmup_updates: 20
+# Successful optimizer updates, not microbatch/attempted-step counters:
 g_bootstrap_updates: 300
 f_warmup_updates: 200
-f_warmup_max_updates: 400  # gia hạn một lần nếu gate tracking chưa đạt
-experiment_generator_updates: 300  # cho MỖI nhánh A/B
-fake_updates_per_generator: 1
-fake_bootstrap_fraction: 0.25
-g_auxiliary_batch_fraction: 0.25
-g_teacher_full_step_probability: 0.5
+f_warmup_max_updates: 400
+experiment_generator_updates: 300
+fake_update_interval_g_updates: 5
+fake_bootstrap_fraction: 0.0
+g_target_refresh_interval_g_updates: 5
+g_teacher_full_step_probability: 0.25
 g_teacher_local_probability: 0.25
-g_bootstrap_full_step_probability: 0.5
-g_teacher_trajectory_weight: 0.25
-g_shortcut_weight: 0.25
-g_dmd_weight: 1.0
-teacher_anchor_beta_max: 0.05
+g_bootstrap_full_step_probability: 0.25
+g_main_local_probability: 0.25
+g_main_teacher_loss_weight: 0.0
+g_main_dmd_weight: 0.0
+teacher_anchor_beta_max: 0.01
 teacher_anchor_beta_ramp_g_updates: 100
 generator_ema_decay: 0.99
 fake_ema_decay: 0.99
-g_shortcut_target_source: ema_g  # B chỉ đổi thành ema_f
+fake_ema_reset_after_warmup: true
+fake_lora_hold_min_g_updates: 200
+fake_lora_fade_duration_g_updates: 1000
+freeze_fake_optimizer_on_fade: true
+freeze_fake_ema_on_fade: true
+fade_requires_readiness_gate: true
+fade_gate_policy: stop_if_not_ready  # không đổi lịch riêng từng arm
+fade_probe_max_mse_ratio: 2.0
+fade_probe_patience: 2
 
+g_shortcut_target_source: ema_g_self  # B: ema_f_local_then_ema_g
+fake_bridge_max_sigma_step: 0.0625
+fake_bridge_min_substeps: 2
 training_seed: 10
 probe_seed: 12345
 checkpoint_interval_g_updates: 150
@@ -201,249 +212,174 @@ primary_metric: hps_v2_1
 secondary_metrics: [clip_score, image_reward, hps_v3]
 ```
 
-Batch default ở512: `8 × 4 × 2 = 64`. Profile `16 × 4 × 1 = 64` và chỉ chọn nó
-nếu toàn bộ P2, optimizer states và checkpoint/resume vừa VRAM với headroom; đổi
-chung trước fork A/B. Nếu b8 OOM, dùng `4 × 4 × 4 = 64` chung cho hai nhánh.
-Hai GPU thì profile `8 × 2 × 4 = 64`; không hứa batch32/GPU vừa bộ nhớ.
-Không hạ global batch theo rank hoặc tự đổi sang 65/128/1024.
-Accumulation chỉ là cách chia batch 64; giảm accumulation không giảm lượng mẫu
-phải tính ở cùng batch. Physical batch phải chia hết cho 4 để có subset 3/4–1/4.
+Batch default `8×4×2=64`; nếu profile đầy đủ cho thấy vừa, chọn chung A/B
+`16×4×1=64` để bỏ accumulation. F CFG call có physical rows2B, cần đo cả F
+backward/AdamW và G/EMA forwards, không chỉ inference. Nếu b8 OOM: `4×4×4=64`.
+2GPU có thể profile `8×2×4=64`. Không đổi global 64. Activation checkpointing bật;
+không giữ model/moments/EMA tất cả BF16 vì LR nhỏ và cần xác minh update thực.
 
-Lý do config: F:G=1:1, G sinh một bước, native512, frozen
-text encoders được cache, teacher trajectories sinh một lần rồi tái dùng. F LoRA96
-giảm phần backward/optimizer/EMA của critic; LR F cao hơn5 lần giúp tracking nhanh
-hơn nhưng không chứng minh đã theo kịp G. Không đưa VAE, T5 hoặc preference
-evaluator vào training step. Batch8/16 trên512 cần profile, không phải kết
-quả đo. G FSDP giữ optimizer/master/EMA shards FP32 trên GPU, BF16 cho forwards;
-F frozen base BF16 + adapter/step embedding/AdamW/EMA FP32 trên GPU. Tránh vòng copy
-full FP32 CPU↔GPU mỗi step. Đây là **mixed precision**, không AdamW all-BF16.
+G full-weight và F LoRA không cùng LR rule; đây là LR chủ project chọn để test.
+F update thưa giảm compute và cadence; LR cao5 lần không chứng minh F chậm về
+field distance. Log norm/relative delta online→EMA-F và EMA-F→T ở fixed states.
+EMA-F sau warm-up reset shadow bằng online adapters đã qua gate, tránh target
+bắt đầu main với EMA còn lag. Sau đó EMA decay0.99, freeze đồng thời khi fade.
+P0 và P2 G dùng optimizer mới/warm20; F P1→P2 **giữ moments/counter/LR đã warmed**.
+Không reset F optimizer ở fork; A/B copy nguyên F state, RNG và snapshot.
 
-`5e-6` và300G có thể chưa đủ để G đạt chất lượng một bước tốt. Gate bên dưới đo
-điều đó thay vì mặc định thành công. Không tự sweep/đổi LR đã chốt trong A/B. Nếu
-P0 không có learning signal, dừng báo lỗi/đề xuất calibration chung trước fork.
-Kết quả âm tính cũng có thể đến từ capacity của F LoRA96; không suy ra mọi fake
-field full-weight đều thất bại. G full vs F LoRA giống hệt giữa A/B, nên không gây
-confound cho phép so nguồn target, nhưng giới hạn phạm vi kết luận.
+## 4. Convention và shortcut cho MMDiT
 
-## 4. Quy ước flow và shortcut bắt buộc
+Dùng physical sigma: `sigma=1` noise, `sigma=0` clean;
+`x_sigma=(1-sigma)*y + sigma*z`, local velocity target `v=z-y`;
+Euler `x_next=x-d*v`. SD3 timestep được truyền là `1000*sigma` (xác nhận
+num_train_timesteps local=1000); không bê DDPM indices/epsilon/scheduler SDXL.
+G là **average velocity trên đoạn dài d**, không gọi instantaneous velocity d=1
+là one-step shortcut. `one_step(G,z,c)=z-G(z,1,1,c)`.
 
-SD3 dùng physical sigma: `sigma=1` là noise, `sigma=0` là clean. Network teacher
-dự đoán velocity theo chiều tăng sigma. Với clean latent y và noise z:
+Giữ nguyên SD3.5 config, dual attention, qk_norm, context stream và VAE geometry.
+Thêm riêng duration MLP cho G vào `time_text_embed` trước các transformer blocks:
+`temb_G=temb_native(t,c)+MLP(Fourier(d))-MLP(Fourier(0))`.
+Last Linear zero-init, nên cả d>0 lúc init và d=0 luôn giữ pretrained embedding
+path. Sau học d=0 vẫn dùng native time/text path với G weights đã train.
+Duration khác timestep: mọi lời gọi G đều có sigma và d, không cộng d vào sigma.
+MLP chạy trước block checkpointing; yêu cầu non-reentrant checkpointing theo
+pinned Diffusers, kiểm tra gradient của nhánh này khi recipient smoke.
 
-```text
-h_sigma = (1-sigma)*y + sigma*z
-v_local = z-y
-h_(sigma-d) = h_sigma - d*S(h_sigma, sigma, d, c)
-G_1step(z,c) = z-S_G(z,1,1,c)
-```
+A finite target: gọi EMA-G trên hai nửa độ dài `d/2`, lần2 ở **model midpoint**,
+lấy trung bình velocities. Với parent d=1/32, child sử dụng d=0 làm local boundary.
+B finite target: tích phân **guided EMA-F instantaneous** qua `d/2` bằng Euler,
+mỗi bước≤1/16 và ít nhất2 substeps; EMA-G dự đoán nửa còn lại từ midpoint đó.
+Full d=1 cần8 F velocity evaluations +1 EMA-G tail; interval ngắn cần2..4 F calls.
+Internal CFG gộp2B vào một field forward: báo cả denoising evaluations và
+conditional branches, không gọi nó là một conditional NFE. Target detached.
 
-`S(x,sigma,d,c)` với `d>0` là **average velocity trên đoạn hữu hạn**, không phải
-instantaneous velocity được đổi tên. `d=0` là local field dùng cho F tracking/DMD.
-G và F đều nhận sigma và d; teacher chỉ có sigma, không có shortcut d hữu hạn.
+G local25% distill trực tiếp guided EMA-F ở re-noised one-step G states; full25%
+học endpoint từ noise; short50% học các d∈{1/2,1/4,1/8,1/16,1/32}. Cả A/B dùng
+cùng loss `0.5*mean((G-target)^2)` trên64 rows, không còn auxiliary1/4 khác batch.
+Chỉ G có finite duration head; F không bootstrap tự học và không nhận finite d.
 
-Với `h=d/2`, target shortcut từ R=EMA-G hoặc EMA-F:
+F target: generate `y_G` với current online G, detach; lấy z' độc lập noise đã tạo
+ảnh, `x=(1-sigma)*y_G+sigma*z'`. MSE supervised field là
+`F_CFG(x,sigma,c)`, target `(z'-y_G + beta*T_CFG(x,sigma,c))/(1+beta)`.
+Warm-up beta0. Main beta=`0.01*min(k_G/100,1)` trước freeze; teacher coefficient
+max~0.99%. Đây là **coefficient**, không bảo đảm norm ảnh hưởng≤1% khi norms
+khác nhau. Log teacher/student target RMS và mixing delta; không áp affine
+“corrected F” khi rollout hoặc distill G. Main không chạy T trong G target/loss.
 
-```text
-a = R(x, sigma, h, c)
-x_mid = x-h*a
-b = R(x_mid, sigma-h, h, c)
-target = stopgrad((a+b)/2)
-```
+F native base clone từ T, không G-after-P0. Train combined F_CFG: nếu train
+conditional F riêng rồi extrapolate CFG thì learned CFM target bị đổi nghĩa.
+λ=0 đúng T_CFG chỉ khi base weights/config/dtype/negative prompt/CFG giống T.
+LoRA scaling plain scalar phải checkpoint riêng và set vào **cả online và EMA-F**.
+Freeze optimizer/EMA updates bằng schedule; không đổi parameter-name set giữa run.
 
-Ở parent `d=1/32`, query hai local fields `d_condition=0` tại hai physical half
-steps 1/64. Các parent còn lại query đúng duration h. Lấy sigma từ các mốc phù hợp
-với d, bảo đảm `0<=d<=sigma<=1`. Midpoint phải do model tạo ra, không lấy điểm
-thẳng trên đường noise–clean. Không copy clipping [-4,4] của latent space khác
-sang SD3.5 mà chưa kiểm tra VAE/latent scale.
+## 5. Data và teacher cache 50 bước
 
-Đây là adapter dựa trên nguyên lý step-size conditioning và binary composition
-của [Shortcut Models](https://arxiv.org/html/2410.12557v3#S3); paper gốc dùng một
-network với local-flow và self-bootstrap, còn ta có teacher, F, DMD và warm-up riêng.
-Không gọi phương pháp mới là official Shortcut Models reproduction.
+Bên nhận đọc captions local, ghi format/schema/source hash, loại null/empty,
+canonicalize NFKC + casefold + whitespace để deduplicate và kiểm tra split overlap.
+Giữ original text cho encoding. Split deterministically bằng seed10:
+train8192 unique, validation128, final test512; thiếu thì fail/ghi quyết định chung,
+không fill duplicates hoặc lấy final test vào train. Cache teacher512 train prompts
+và128 val prompts; các128 val dùng gates, không G optimization.
 
-F teacher anchoring **chỉ ở d=0**:
+Text encoders frozen/cache rồi unload khỏi trainer: dùng native SD3 pipeline
+`encode_prompt` cùng prompt cho CLIP-L/CLIP-G/T5, sequence length256; cache
+positive tokens+pooled và negative empty string qua cùng encoders. Không tự nối
+embeddings khác native pipeline. Hash tokenizer/text model/precision/negative policy.
+Training prompts stream phân chia disjoint theo rank; lưu shuffle epoch/cursor/RNG.
 
-```text
-target_F_local = (z-y_G + beta*T_CFG(h_sigma,sigma,c))/(1+beta)
-F_local_corrected = (1+beta)*F(h_sigma,sigma,0,c)-beta*T_CFG(h_sigma,sigma,c)
-```
+Teacher cache dùng **native FlowMatchEulerDiscreteScheduler.set_timesteps(50)**,
+mu theo image sequence ở512 khi `use_dynamic_shifting`, từ config local. Lưu
+**51 states + actual 51 physical sigmas**, `timestep=1000*sigma`. Sigma đã shift;
+không shift lần2 hoặc giả định grid uniform/dyadic. Assert starts1, ends0,
+strict descending, no stochastic sampling/invert sigmas/unsupported scheduler.
+Native50 là **setting teacher đã chốt**, không phải giới hạn cứng của model;
+[model card chính thức](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium)
+minh họa40 và số bước configurable.
 
-Warm-up F dùng beta=0. DMD dùng corrected **local** F, trajectory dùng raw
-**finite** EMA-F. Không dùng affine correction trên F finite shortcut: correction
-instantaneous không chứng minh correction finite-time ODE. Không áp external CFG
-lên G hay EMA-F sau khi target teacher có guidance đã được học vào conditional path.
+Code teacher rollout dùng native sigma grid và Euler update **tích lũy FP32**,
+CFG arithmetic FP32 từ BF16 predictions. Cache FP32 thực, không cast mỗi Euler
+state về BF16. Stock pipeline BF16 có rounding khác: GPU preflight kiểm tra
+scheduler update trên cùng FP32 sample/output, rồi report endpoint difference với
+stock pipeline50 từ cùng noise/CFG/encodings; không hứa bitwise parity. Không dùng clipping/rescale/skip-layer guidance hoặc
+control adapters.
+Cache states FP32 `[B,51,16,64,64]`, lưu chunk nhỏ. 640×51 latent states~7.97GiB,
+chưa gồm text/metadata; không giữ toàn bộ cache GPU. BF16 subtraction hai states
+cạnh nhau có thể phá small-d labels, không tiết kiệm bằng cách hạ states BF16.
+Cache manifest lưu model/config/scheduler/sigma/noise/prompt hashes, code commit.
 
-## 5. Data, teacher cache và conditioning
+Full target d1 lấy exact cache noise→endpoint. Finite dyadic target nội suy
+piecewise-linear **actual physical sigma** giữa native states rồi lấy average
+velocity; đó là label từ cached Euler interpolant, không gọi exact continuous
+teacher flow. Local d0 label lấy slope actual native edge ở cached vertex. Không
+lấy binary index spans trên50-step cache. Teacher cache chỉ tạo một lần, không
+50 teacher calls ở mỗi optimizer update.
 
-**Dùng reLAION local sẵn có**, chỉ đọc captions, không tải ảnh hoặc thay bằng bộ
-caption khác. Bên nhận map cột text thực tế của JSONL/Parquet/CSV; tên reLAION không
-đủ để tự đoán split, revision hay quality filter. Ghi local source fingerprint,
-schema, text/id columns, original row ids, sampling order và filter policy.
+## 6. Training phases, cadence và readiness
 
-Sau lọc caption rỗng/duplicate, chọn bằng seed10: 8192 training prompts, 128
-validation prompts, 512 test prompts **không giao nhau**. Nếu nguồn không đủ
-8832 unique prompts thì fail và báo count, không lấy lại validation/test vào train.
-Canonical duplicate key: Unicode NFKC, collapse whitespace, casefold; giữ nguyên
-caption gốc cho encoders. Nếu chuẩn bị benchmark COCO, loại overlap với final
-COCO prompts trước khi chốt train pool. Không dùng test để tune hoặc chọn images.
+**P0 — G bootstrap:** G bắt đầu từ T native full weights + zero duration branch.
+Train300 successfulG trên cache train512, loss mixed25%full/25%local/50%short.
+G/EMA-G master FP32, BF16 forwards; không F/DMD. Validate cả online G và EMA-G native512 one-step trên
+128 val; EMA-G phải qua gate vì dùng để eval/target: finite, no obvious collapse/blank; endpoint MSE cải thiện≥20% so initialized
+G trên matched validation noise, primary image score không giảm>0.25 baseline
+per-prompt std. Đây là heuristic cold-start gate, không theorem. Nếu P0 fail,
+không tiếp tục giả là student one-step usable; báo và revise chung trước fork.
 
-Teacher cache chỉ chọn512 prompts **từ train pool8192**, mỗi prompt một seed noise,
-cộng128 validation prompts. P0 dùng cache512; P1/P2 on-policy dùng cả train
-pool8192 với fresh seeds. Common teacher anchor P2 lấy batch riêng từ cache512 và
-conditioning riêng đúng ids; không ép mọi on-policy sample phải nằm trong cache.
-8192/512 là budget screening đề xuất, không giả là toàn bộ reLAION. Tất cả A/B
-dùng cùng danh sách/hash/prompt streams, không fork rồi tự chọn lại dữ liệu.
+**P1 — F warm:** freeze current online G, F base T + fresh zero-B LoRA. Train200F
+on-policy local CFM beta0, batch 64; G không update. Validate fixed held-out
+renoising pairs từ one-step G: normalized F_CFG CFM MSE ≤0.8×native T_CFG MSE,
+nonzero optimizer master delta, no nonfinite. Báo online+EMA F, field RMS,
+relative T→F drift. Nếu chưa đạt, extend200 một lần (max400), không thay LR/target
+âm thầm. Gate phải đạt với EMA-F used as target; nếu chỉ online đạt, reset EMA=online
+và chạy lại val gate. Chốt shared init G/EMA-G/F/EMA-F/optimizers/RNG/probes;
+reset EMA-F to validated online F, G P2 optimizer mới nhưng F optimizer giữ.
 
-Cache teacher uniform **physical sigma** 32 Euler steps từ noise đến clean, CFG4.5.
-Đây là solver ta chọn cho các labels dyadic; không gọi nó là scheduler mặc định
-SD3.5. `scheduler.shift` không được áp lại vào sigma/timestep. Lưu scheduler config
-gốc và lựa chọn `uniform_physical_sigma` rõ ràng. Nếu teacher cache ở512 cho ảnh
-kém ngay từ đầu, sửa solver/budget chung trước khi distill; không dùng teacher kém
-làm chuẩn rồi kết luận student tốt. Reference teacher official sampler có thể đo
-riêng, với NFE/scheduler/CFG thực tế được ghi lại.
+**P2 — từng arm A/B, k_G reset0:**
 
-Tái dùng 32-step trajectories cho G bootstrap và common teacher anchor sau fork.
-Cache `[M+1,16,H/8,W/8]` **FP32** trên disk, đọc batch theo rank. G input noise và
-teacher clean phải cùng seed/coupling. Từ các states x_i,x_j:
-`v_bar=(x_i-x_j)/(sigma_i-sigma_j)`. Local label d=0 lấy slope của edge đầu tiên,
-đúng velocity teacher đã dùng trong Euler. Không finite-difference states BF16.
+1. Boundary k_G=0,5,10,... trước fade: 1 F update successful theo fresh detached
+   current G samples, β ramp; update EMA-F. F targets không cache/replay5 lần.
+2. Set λ theo event schedule. Tạo global 64 G targets từ current G + EMA-G/EMA-F,
+   detached, fixed prompt/noise IDs. A/B nguồn finite khác nhau, local giống nhau.
+3. G train5 successful updates trên **chính64 cached target rows**; mỗi update
+   loss64 và accumulation đúng. EMA-G update sau mỗi G optimizer success.
+4. Boundary k_G=200: **trước** F update mới, audit fade gate. Nếu fail, save/stop
+   arm; không claim final A/B đủ matched khi một arm thiếu steps. Nếu cả arm đạt,
+   freeze online F và EMA-F; không optimizer/EMA-F update sau event; giảm λ theo
+   k_G tại mỗi refresh boundary. Adapter snapshots giữ nguyên, không merge LoRA.
+5. Pilot stop at 300 successfulG; lưu EMA-G export, matched final one-step test.
+   Continue cả A/B tới1200 nếu cần kiểm chứng hoàn tất fade, đúng fixed policy.
 
-Ở512, latent64×64, phần states khoảng `640×33×16×64×64×4 ≈ 5.16 GiB`; embeddings và metadata
-thêm dung lượng. Đây là tính số học của tensor states, không phải disk usage đo
-thật. Không lưu teacher images mọi sample, chỉ decode nhóm kiểm tra nhỏ.
+Fade readiness tối thiểu: gates P0/P1 còn hiệu lực; tại150 và200 F tracking giữ
+≤0.8×T CFM MSE trên matched current student probe states; current val primary
+không giảm>0.25 baseline std so shared init và không tụt>0.1 baseline std từ150→200;
+no nonfinite/skip trong50G gần nhất. Ngưỡng là screening heuristic phải khóa trước
+fork; đo thêm target drift và G gradient/update norms. Không đủ evidence thì
+**200 không được tự coi là “đủ lâu”**. Primary image metric đã khóa chưa usable thì chưa thể qua image gate.
+Gates là validation-only; final test không dùng chọn lịch. Báo cả gate pass/fail
+bởi khác biệt đó cũng là outcome, không lọc arm xấu khỏi báo cáo.
 
-Conditioning dùng đủ CLIP-L, CLIP-G và T5 qua `StableDiffusion3Pipeline.encode_prompt`;
-cache positive tokens/pooled và negative empty-prompt tokens/pooled. **Negative
-không phải zero embeddings kiểu SDXL.** G/F chỉ nhận positive; T_CFG nhận cả hai.
-Giữ T5 maximum length256, truncation policy và tokenizer/encoder hashes giống nhau.
-Chuẩn bị cache text trong job riêng rồi giải phóng cả ba encoders; training chỉ
-load transformer T/G/F/EMA và conditioning cache. VAE chỉ decode khi probe/eval.
+Sau freeze, λ(k)=max(0,1-(k-200)/1000), actual target strength giữ piecewise theo
+refresh5G; k200=1,300=.9,700=.5,1200=0. Float strength ứng với target refresh k,
+không recompute λ tại từng microbatch. F updates main ởk0..195:40, cộngP1;
+P2 teacher anchor chỉ tại 40 F updates, không phải300G updates. Pilot G có60 target
+refreshes (64×60=3840 new target rows,19200 row presentations), không gọi19200
+unique training samples. P0/P1/shared init là chung overhead, báo riêng.
 
-Decode SD3: `vae.decode(latent/scaling_factor + shift_factor)`; lấy coefficients
-từ VAE checkpoint. Cả teacher/G/F dùng latent `[B,16,64,64]` và decode native512.
-Cache text cho cả train/val/test, còn teacher trajectories chỉ640 prompts. Negative
-empty-prompt embeddings có thể lưu một bản rồi expand, không copy hàng nghìn lần.
+Mỗi refresh sau fade λ giảm0.005 cho5 G updates: target đứng yên trong block để
+G thích nghi. Đây là lịch chậm đề xuất, chưa bảo đảm G theo kịp. Mỗi50G dựng fresh
+validation targets theo đúng arm, đo G local/full/short MSE ngoài replay batches.
+Nếu tổng MSE >2×max(mốc k200,1e-8) trong2 probes liên tiếp, hoặc primary image score giảm
+>0.25 baseline std so shared init, save/stop và report adaptation failure. Không
+âm thầm tăng LR, pause λ riêng một arm hay chọn checkpoint đẹp để che lag. Muốn
+lịch chậm hơn thì revise chung protocol cho run mới từ saved common boundary.
 
-Nguồn adapter: [SD3 Diffusers v0.33.1](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3.py),
-[SD3 transformer v0.33.1](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/transformers/transformer_sd3.py).
-CFG4.5 là lựa chọn từ [ví dụ model card SD3.5 Medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium),
-không lấy CFG1 của FD-loss gán thành guidance teacher.
+## 7. Original reference kernels — cần integration trên máy bên nhận
 
-## 6. Ba phase và warm-up F theo student
-
-### P0 — G học shortcut teacher, trước khi tạo đối chứng
-
-Từ base pretrained T, tạo G độc lập và thêm embedding duration có zero output ở
-khởi tạo. Optimizer G mới. Train300 successful G updates bằng labels teacher cache:
-kỳ vọng25% d=0, 50% d=1, 25% dyadic finite khác; chọn sigma đúng grid mỗi sample. T/F không
-train; P0 chưa dùng DMD hay cross-fake targets. Local teacher CFG và finite average
-velocity được học vào G conditional, nên inference không cần external CFG. EMA-G
-khởi tạo từ G và update từ FP32 shards sau từng successful G step trong P0.
-
-Validation cố định: endpoint MSE so teacher ở 1-step trên128 prompts;
-endpoint errors ở2/4/8 steps chỉ trên16 validation prompts để giảm chi phí,
-ảnh 1-step/teacher, latent mean/std, số nonfinite, global grad norm và master delta.
-G phải có learning signal trên validation, không chỉ train loss. Nếu 300 updates
-vẫn không cải thiện **1-step** endpoint error và ảnh1-step còn noise/collapse,
-chưa chạy A/B dù ảnhfew-step tốt. Dừng
-để debug dấu/sigma/duration/grad/conditioning hoặc calibration LR chung. Không
-chuyển sang DMD2/distilled checkpoint để che lỗi cold start.
-
-### P1 — F warm-up trên phân phối G đã bootstrap
-
-Snapshot online G sau P0 để khởi tạo **F độc lập**, gồm backbone và duration
-embedding; không chia sẻ Parameter/storage với G. Freeze backbone F ở BF16, thêm
-LoRA96 zero-B lên joint/dual attention và FF projections đã chọn; duration MLP
-train FP32. Không LoRA hóa mọi Linear một cách mù quáng; xem §7/§8.
-Copy weights chỉ là initialization. F chỉ update LoRA và duration MLP, không update
-frozen backbone, original time/text projection, patch Conv2d hay output projection.
-Giữ G cố định về weights, không step optimizer G và không update EMA-G. Sinh fresh
-noise, lấy `y_G=G_1step(z,c).detach()`, rồi dùng **noise độc lập** để tạo h_sigma.
-
-Train200 successful F updates: 3/4 batch local CFM target `z_new-y_G`; 1/4 batch
-raw EMA-F binary shortcut target. beta=0 toàn bộ phase; không teacher-output bias,
-không DMD vào G. EMA-F chỉ lưu FP32 trainable LoRA/duration tensors và dùng lại
-frozen base bất biến của F; update sau mỗi successful F step. Với checkpointing,
-frozen G forward vẫn ở no_grad; không cần đổi requires_grad của FlatParameter
-FSDP sau khi wrap. Ở parent nhỏ nhất EMA-F local field là base case.
-
-Probe tracking trước/sau warm-up trên 128 **held-out** prompts của G và noise cố
-định: local velocity MSE / target energy, buckets sigma0.1/0.3/0.5/0.7/0.9, và
-finite shortcut composition residual. CFM có variance không triệt tiêu nên không
-đặt mục tiêu loss=0. Gate đề xuất: normalized held-out local MSE giảm ít nhất10%
-so F vừa copy từ G, không nonfinite/collapse, finite targets có RMS hợp lý. 10% là
-heuristic screening, không phải định lý F đã khớp phân phối. Nếu chưa đạt, gia hạn
-warm-up thêm200F một lần; vẫn không đạt thì dừng và báo thiếu tracking trước A/B.
-
-Kiểm tra finite field trên16 validation prompts: cùng start state, so một
-EMA-F shortcut d=1/1⁄2/1⁄4 với32 local Euler substeps của chính EMA-F(d=0),
-ghi normalized endpoint error và latent RMS trước/sau warm-up. Không ép endpoint
-F từ một noise phải trùng `G(noise)`: F local học marginal bằng independent
-re-noising, không học đúng pairing của generator. Self-composition residual nhỏ
-một mình không chứng minh F đã theo student; cần cả local tracking và images.
-
-Gate không được chỉ nhìn warm-up train loss; không dùng beta>0 để làm target dễ hơn.
-F vừa học student local distribution vừa học finite shortcuts; không chỉ thêm MSE
-teacher local rồi gọi là trajectory distillation.
-
-### P2 — fork checkpoint chung, A/B mỗi nhánh300G
-
-Lưu G/F, EMA-G/EMA-F, config, cache/provenance và tracking report. Đây là **shared
-initialization**. Cả A/B load đúng cùng hashes, tạo optimizer G/F mới, reset
-experiment counters k_G=k_F=0, cùng seed và prompt/noise streams. Lưu EMA-G P0
-không đổi xuyên P1; giữ EMA-F đã warm-up, không reset EMA-F về F/teacher khác.
-
-Trong mỗi cycle: một successful F update trước, một successful G update sau.
-`beta=0.05*min(k_G/100,1)`, giữ nguyên beta xuyên F và G của cycle. F cập nhật
-3/4 mixed local tracking + 1/4 EMA-F shortcut. EMA-F update sau F success.
-
-G loss cho cả A/B:
-
-```text
-L_G = L_DMD + 0.25*L_teacher_trajectory + 0.25*L_bootstrap
-```
-
-L_DMD: sinh ảnh một bước từ fresh noise (giữ graph), re-noise tại sigma trong
-[0.02,0.98], direction detached từ frozen teacher CFG và corrected F local.
-L_teacher_trajectory: batch phụ bằng1/4 physical batch, lấy riêng từ cache512
-cùng conditioning đúng cache ids, giống P0 (50% full d=1).
-L_bootstrap: subset1/4 batch, 50% full(sigma=1,d=1) và50% shorter intervals,
-trên h_sigma re-noised từ current
-G endpoint; target bằng hai raw half-shortcuts của **EMA-G ở A / EMA-F ở B**.
-Target, midpoint và generated endpoint dùng làm input phụ đều detach. Chỉ G nhận
-gradient từ G loss; chỉ F nhận gradient từ F loss.
-
-G direct/DMD dùng **100% batch endpoints từ one-step G**. Teacher anchor và
-bootstrap ưu tiên full interval như trên; không chỉ train local/few-step rồi hy
-vọng G tự suy ra một bước. Các tỷ lệ là sampling probabilities, không bảo đảm
-đúng50% trong từng microbatch nhỏ; runtime log counts rồi aggregate qua ranks/windows.
-
-G direct dùng guided DMD trên một noisy state/time, không bê lịch 4 anchors SDXL.
-Ở one-step này dùng coupled direct estimator để giảm teacher calls; không claim
-đã reproduce Decoupled CA/DM independent schedules. Correction chỉ phục vụ F local.
-
-Flow DMD surrogate cụ thể: `x0_T=x-sigma*T_CFG`,
-`x0_F=x-sigma*F_corrected`, direction `(x0_F-x0_T)` chia theo per-sample
-`mean(abs(y_G-x0_T)).clamp_min(1e-3)`. G proxy là MSE tới
-`stopgrad(y_G-direction)`. Đây là lựa chọn clean-prediction DMD-style weighting
-chung A/B, không khẳng định là unbiased KL gradient với mọi flow time weighting.
-Theo dõi direction RMS/clip rate, không diễn giải số proxy loss là quality metric.
-
-EMA-G update từ FP32 optimizer/master shards sau G success; EMA-F update từ FP32
-LoRA/duration optimizer tensors sau F success, không từ full BF16 outputs/weights.
-EMA-F và EMA-G cùng
-decay0.99, cùng1:1 update ratio trong P2 để nguồn target không bị confound bởi decay
-khác. Update counters là successful optimizer steps, không microbatches; cả A/B
-phải ghi số skipped attempts và tổng samples để nhận biết budget thực tế khác.
-
-## 7. Code lõi mới để tách thành `src/sd35_shortcut/shortcut_core.py`
-
-Code dưới đây viết mới cho design này, không lấy code từ dự án training cũ.
-Torch/Diffusers upstream là dependencies; paper/official implementations là nguồn
-đối chiếu nguyên lý. Bên nhận viết data loader, trainer, checkpoint, collective
-finite checks và logger mới trong project độc lập. **Đây chưa phải trainer CLI
-hoàn chỉnh.** Các inputs/kwargs phải được runtime validate trên mọi rank trước
-forward; không dùng code mẫu như một vòng training đã được kiểm nghiệm.
+Code sau là phương trình, model wrappers, LoRA, target builders và FSDP helper;
+**không** có distributed loop, CLI, manifest/checkpointer, metric adapters hoặc
+fade readiness implementation hoàn chỉnh. Hai target phases phải tách khỏi
+backward phase để FSDP EMA-G không nằm trong G outer differentiable forward.
+`main_phase_schedule` chứa cadence/β/λ default; runtime phải xử lý readiness event
+trước khi gọi và checkpoint transaction state, không phải scheduler thay thế gates.
+Mọi runtime checks trước collective phải thực hiện đồng bộ trên các ranks.
 
 ```python
 """Reference kernels for the SD3.5 experiment; integrate with the recipient runtime."""
@@ -516,8 +452,9 @@ class StepConditioning(nn.Module):
             )
         d = self.active_duration
         # The duration branch contributes zero at d=0, including learned biases.
-        extra = self.duration(self.features(d)) - self.duration(
-            self.features(torch.zeros_like(d))
+        dtype = self.duration[0].weight.dtype
+        extra = self.duration(self.features(d).to(dtype)) - self.duration(
+            self.features(torch.zeros_like(d)).to(dtype)
         )
         return result + extra.to(result.dtype)
 
@@ -538,11 +475,13 @@ class SD35Field(nn.Module):
     def forward(self, x, sigma, duration, condition):
         sigma = batch_value(sigma, x)
         duration = batch_value(duration, x)
+        # Cast model inputs only. Keep sigma, cached targets and loss arithmetic FP32.
+        dtype = self.transformer.pos_embed.proj.weight.dtype
         kwargs = {
-            "hidden_states": x,
+            "hidden_states": x.to(dtype),
             "timestep": sigma * self.time_scale,
-            "encoder_hidden_states": condition.tokens,
-            "pooled_projections": condition.pooled,
+            "encoder_hidden_states": condition.tokens.to(dtype),
+            "pooled_projections": condition.pooled.to(dtype),
             "return_dict": False,
         }
         if self.shortcut:
@@ -562,23 +501,24 @@ class LoRALinear(nn.Module):
         self.b = nn.Parameter(torch.zeros(base.out_features, rank, **options))
         nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
         self.scale = alpha / rank
+        self.adapter_strength = 1.0
 
     def forward(self, x):
         original = self.base(x)
+        if self.adapter_strength == 0.0:
+            return original
         delta = F.linear(F.linear(x.float(), self.a), self.b)
-        return original + (self.scale * delta).to(original.dtype)
+        return original + (self.adapter_strength * self.scale * delta).to(
+            original.dtype
+        )
 
 
 def configure_fake_lora(field, *, rank=96, alpha=96):
-    """Load the G snapshot first; create optimizers/DDP/EMA after this function."""
-    if not field.shortcut:
-        raise ValueError("F needs finite-duration conditioning")
-    # Preserve learned G duration weights in FP32 while quantizing only the frozen base.
-    duration_module = field.transformer.time_text_embed.duration
-    duration_state = {
-        name: value.detach().float().clone()
-        for name, value in duration_module.state_dict().items()
-    }
+    """Frozen native TEACHER backbone + trainable LoRA; not a G snapshot."""
+    if field.shortcut:
+        raise ValueError(
+            "F must be the native teacher field, without duration embedding"
+        )
     field.requires_grad_(False).to(dtype=torch.bfloat16)
     names = []
 
@@ -620,9 +560,47 @@ def configure_fake_lora(field, *, rank=96, alpha=96):
     # No LoRA on AdaLN modulation, timestep/text projections, patch/output heads.
     if not names:
         raise ValueError("No SD3 transformer block Linear projections found")
-    duration = field.transformer.time_text_embed.duration.float().requires_grad_(True)
-    duration.load_state_dict(duration_state, strict=True)
     return names
+
+
+def set_fake_strength(raw_task, strength):
+    """Call at target-refresh boundaries; checkpoint the scalar separately."""
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("LoRA strength must lie in [0,1]")
+    for module in raw_task.modules():
+        if isinstance(module, LoRALinear):
+            module.adapter_strength = float(strength)
+
+
+def fake_strength(k_g, *, fade_started_at_g=None, fade_duration=1000):
+    if fade_duration <= 0:
+        raise ValueError("Fade duration must be positive")
+    if fade_started_at_g is None:
+        return 1.0
+    return max(0.0, 1.0 - max(0, k_g - fade_started_at_g) / fade_duration)
+
+
+def main_phase_schedule(k_g, *, fade_started_at_g=None):
+    """Apply a validated fade event BEFORE calling this at a boundary.
+
+    Runtime owns readiness gates and transaction/replay state: a due F update
+    must not execute twice after restart. Strength changes only at target refresh.
+    """
+    if not isinstance(k_g, int) or k_g < 0:
+        raise ValueError("k_g must count successful nonnegative G updates")
+    if fade_started_at_g is not None and (
+        fade_started_at_g < 0 or fade_started_at_g > k_g or fade_started_at_g % 5
+    ):
+        raise ValueError("Fade event must be a completed target-refresh boundary")
+    frozen = fade_started_at_g is not None
+    refresh_k = k_g - k_g % 5
+    return {
+        "fake_update_due": not frozen and k_g % 5 == 0,
+        "target_refresh_due": k_g % 5 == 0,
+        "fake_frozen": frozen,
+        "beta": 0.0 if frozen else 0.01 * min(k_g / 100, 1.0),
+        "lora_strength": fake_strength(refresh_k, fade_started_at_g=fade_started_at_g),
+    }
 
 
 class AdapterEMA:
@@ -653,7 +631,7 @@ class AdapterEMA:
         from torch.func import functional_call
 
         # No dropout, mutable normalization statistics or concurrent use of raw_task.
-        # Frozen base parameters remain identical, adapters/step embedding are replaced.
+        # Frozen base parameters remain identical; only LoRA tensors are replaced.
         return functional_call(self.model, self.shadow, args, kwargs, strict=False)
 
 
@@ -677,23 +655,55 @@ def sample_shortcuts(model, noise, condition, *, steps=1):
     return state
 
 
-@torch.no_grad()
-def teacher_cfg(teacher, x, sigma, condition, negative, guidance):
-    conditional = teacher(x, sigma, 0.0, condition)
-    unconditional = teacher(x, sigma, 0.0, negative)
+def guided_velocity(field, x, sigma, condition, negative, guidance):
+    """Supervise F's COMBINED guided field, not conditional field before CFG."""
+    combined = Condition(
+        torch.cat((negative.tokens, condition.tokens)),
+        torch.cat((negative.pooled, condition.pooled)),
+    )
+    predictions = field(
+        torch.cat((x, x)), batch_value(sigma, x).repeat(2), 0.0, combined
+    )
+    unconditional, conditional = predictions.chunk(2)
     return unconditional + guidance * (conditional - unconditional)
 
 
 @torch.no_grad()
-def teacher_rollout(teacher, noise, condition, negative, *, steps=32, guidance=4.5):
-    if steps < 2 or steps & (steps - 1):
-        raise ValueError("Use a power-of-two uniform-sigma teacher grid")
+def teacher_cfg(teacher, x, sigma, condition, negative, guidance):
+    return guided_velocity(teacher, x, sigma, condition, negative, guidance)
+
+
+@torch.no_grad()
+def native_teacher_sigmas(scheduler, transformer, device, *, resolution=512, steps=50):
+    """Construct the pinned SD3 pipeline's resolution-aware native Euler schedule."""
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+        calculate_shift,
+    )
+
+    config = dict(scheduler.config)
+    kwargs = {}
+    if config.get("use_dynamic_shifting", False):
+        side = resolution // 8 // transformer.config.patch_size
+        kwargs["mu"] = calculate_shift(
+            side * side,
+            config.get("base_image_seq_len", 256),
+            config.get("max_image_seq_len", 4096),
+            config.get("base_shift", 0.5),
+            config.get("max_shift", 1.16),
+        )
+    scheduler.set_timesteps(steps, device=device, **kwargs)
+    return scheduler.sigmas.detach().to(device=device, dtype=torch.float32).clone()
+
+
+@torch.no_grad()
+def teacher_rollout(teacher, noise, condition, negative, sigmas, *, guidance=4.5):
+    """Native FlowMatch Euler grid; validate 51 physical nodes for 50 steps."""
     x = noise.float()
     states = [x.cpu()]
-    for index in range(steps):
-        sigma = 1.0 - index / steps
+    for index in range(len(sigmas) - 1):
+        sigma = sigmas[index]
         velocity = teacher_cfg(teacher, x, sigma, condition, negative, guidance)
-        x = x - velocity / steps
+        x = x - (sigma - sigmas[index + 1]) * velocity
         states.append(x.cpu())
     # Keep states FP32: subtracting nearby BF16 states corrupts small-duration targets.
     return torch.stack(states, dim=1)
@@ -701,7 +711,7 @@ def teacher_rollout(teacher, noise, condition, negative, *, steps=32, guidance=4
 
 def draw_dyadic(count, device, generator, *, levels=5, full_step_probability=None):
     if full_step_probability is None:
-        # F retains its uniform hierarchy, including d=1.
+        # Uniform hierarchy when no full-interval probability is requested.
         exponent = torch.randint(
             levels + 1, (count,), device=device, generator=generator
         )
@@ -736,53 +746,165 @@ def shortcut_target(
 
 
 @torch.no_grad()
-def local_rollout(model, x, sigma, duration, condition, *, steps=32):
-    """Diagnostic reference: many small Euler steps of the SAME raw local field."""
-    sigma = batch_value(sigma, x)
-    step = batch_value(duration, x) / steps
-    state = x.float()
-    for index in range(steps):
-        velocity = model(state, sigma - index * step, 0.0, condition)
-        state = state - coefficients(step, state) * velocity
-    return state
+def local_fake_bridge(
+    ema_f,
+    x,
+    sigma,
+    duration,
+    condition,
+    negative,
+    *,
+    guidance=4.5,
+    max_step=1 / 16,
+    min_substeps=2,
+    enabled=None,
+):
+    """Integrate instantaneous EMA-F across the FIRST HALF of a G interval."""
+    half = duration / 2
+    counts = torch.ceil(half / max_step).long().clamp_min(min_substeps)
+    if enabled is not None:
+        counts = torch.where(enabled, counts, 0)
+    step = half / counts.clamp_min(1).float()
+    state = x.float().clone()
+    # Native d<=1, so at most eight F evaluations per sample at max_step=1/16.
+    bound = max(min_substeps, math.ceil(0.5 / max_step))
+    for index in range(bound):
+        active = torch.nonzero(counts > index, as_tuple=True)[0]
+        if active.numel() == 0:
+            continue
+        velocity = guided_velocity(
+            ema_f,
+            state[active],
+            sigma[active] - index * step[active],
+            condition.take(active),
+            negative.take(active),
+            guidance,
+        )
+        state[active] = (
+            state[active] - coefficients(step[active], state[active]) * velocity
+        )
+    # Only raw F/AdapterEMA calls here: no DDP/FSDP collectives in rank-local loops.
+    return state.detach(), counts.detach()
+
+
+@torch.no_grad()
+def generator_bootstrap_target(
+    ema_g,
+    ema_f,
+    x,
+    sigma,
+    duration,
+    condition,
+    negative,
+    *,
+    source,
+    minimum_duration=1 / 32,
+    bridge_max_step=1 / 16,
+    bridge_min_substeps=2,
+    guidance=4.5,
+    enabled=None,
+):
+    if source == "ema_g_self":
+        return shortcut_target(
+            ema_g, x, sigma, duration, condition, minimum_duration=minimum_duration
+        ), torch.zeros_like(duration, dtype=torch.long)
+    if source != "ema_f_local_then_ema_g":
+        raise ValueError(f"Unsupported bootstrap target: {source}")
+    # Runtime validates the source whitelist before collective forward.
+    midpoint, counts = local_fake_bridge(
+        ema_f,
+        x,
+        sigma,
+        duration,
+        condition,
+        negative,
+        guidance=guidance,
+        max_step=bridge_max_step,
+        min_substeps=bridge_min_substeps,
+        enabled=enabled,
+    )
+    half = duration / 2
+    child = torch.where(duration <= minimum_duration + 1e-7, 0.0, half)
+    # Exactly one EMA-G tail call on EVERY rank, even with different local F counts.
+    endpoint = midpoint - coefficients(half, midpoint) * ema_g(
+        midpoint, sigma - half, child, condition
+    )
+    return ((x.float() - endpoint) / coefficients(duration, x)).detach(), counts
+
+
+def interpolate_cached_states(states, sigmas, query):
+    """FP32 piecewise-linear interpolation of a native, nonuniform teacher cache."""
+    edge = torch.searchsorted(-sigmas.contiguous(), -query.contiguous(), right=True) - 1
+    edge = edge.clamp(0, len(sigmas) - 2)
+    row = torch.arange(states.shape[0], device=states.device)
+    fraction = (sigmas[edge] - query) / (sigmas[edge] - sigmas[edge + 1])
+    start, end = states[row, edge].float(), states[row, edge + 1].float()
+    return start + coefficients(fraction, start) * (end - start)
+
+
+def target_kinds(
+    count, device, generator, *, full_probability=0.25, local_probability=0.25
+):
+    """Exact row counts per microbatch; runtime validates divisibility before collectives."""
+    full_count = float(count * full_probability)
+    local_count = float(count * local_probability)
+    if (
+        full_probability < 0
+        or local_probability < 0
+        or full_probability + local_probability > 1
+        or not full_count.is_integer()
+        or not local_count.is_integer()
+    ):
+        raise ValueError("Target fractions must produce exact integer row counts")
+    order = torch.randperm(count, device=device, generator=generator)
+    full = order < int(full_count)
+    local = (order >= int(full_count)) & (order < int(full_count + local_count))
+    return full, local
 
 
 def cached_teacher_batch(
-    states, generator, *, full_step_probability=0.5, local_probability=0.25
+    states,
+    sigmas,
+    generator,
+    *,
+    full_step_probability=0.25,
+    local_probability=0.25,
+    levels=5,
 ):
-    """states [B,M+1,C,H,W], generated by teacher_rollout. Return x,sigma,d,target."""
+    """Native 50-step states + sigma nodes -> local/finite/full G labels."""
     b, points = states.shape[:2]
-    steps = points - 1
-    if steps < 2 or steps & (steps - 1):
-        raise ValueError("Cache grid must have a power-of-two step count")
-    levels = int(math.log2(steps))
-    exponent = torch.randint(levels, (b,), device=states.device, generator=generator)
-    span = 2**exponent
-    kind = torch.rand(b, device=states.device, generator=generator)
-    full = kind < full_step_probability
-    local = (kind >= full_step_probability) & (
-        kind < full_step_probability + local_probability
+    sigma, duration = draw_dyadic(
+        b, states.device, generator, levels=levels, full_step_probability=0.0
     )
-    span = torch.where(full, steps, torch.where(local, 1, span))
-    slot = (
-        torch.rand(b, device=states.device, generator=generator) * (steps // span)
-    ).long()
-    start = slot * span
+    full, local = target_kinds(
+        b,
+        states.device,
+        generator,
+        full_probability=full_step_probability,
+        local_probability=local_probability,
+    )
+    sigma = torch.where(full, 1.0, sigma)
+    duration = torch.where(full, 1.0, duration)
+    x = interpolate_cached_states(states, sigmas, sigma)
+    endpoint = interpolate_cached_states(states, sigmas, sigma - duration)
+    target = (x - endpoint) / coefficients(duration, x)
+    # Local labels use actual native vertices/edges, avoiding interpolated local states.
+    edge = torch.randint(points - 1, (b,), device=states.device, generator=generator)
     row = torch.arange(b, device=states.device)
-    x = states[row, start].float()
-    endpoint = states[row, start + span].float()
-    physical_duration = span.float() / steps
-    target = (x - endpoint) / coefficients(physical_duration, x)
-    sigma = 1.0 - start.float() / steps
-    duration = torch.where(local, 0.0, physical_duration)
-    # For d=0 the first Euler edge is the teacher's local velocity at the saved state.
+    local_x = states[row, edge].float()
+    local_target = (local_x - states[row, edge + 1].float()) / coefficients(
+        sigmas[edge] - sigmas[edge + 1], local_x
+    )
+    mask = local.reshape(-1, *([1] * (x.ndim - 1)))
+    x, target = torch.where(mask, local_x, x), torch.where(mask, local_target, target)
+    sigma = torch.where(local, sigmas[edge], sigma)
+    duration = torch.where(local, 0.0, duration)
     return x, sigma, duration, target.detach()
 
 
 @torch.no_grad()
 def fake_targets(
     g,
-    ema_f,
     teacher,
     noise,
     independent_noise,
@@ -792,156 +914,125 @@ def fake_targets(
     *,
     beta,
     guidance=4.5,
-    levels=5,
 ):
-    """3/4 local student-tracking CFM + 1/4 raw-F shortcut targets."""
+    """All samples train instantaneous F on the current one-step G distribution."""
     b = noise.shape[0]
-    if b % 4:
-        raise ValueError("Physical batch must be divisible by four")
-    local_count = 3 * b // 4
     y = one_step(g, noise, condition).detach()
     sigma = torch.rand(b, device=y.device, generator=generator)
     duration = torch.zeros_like(sigma)
-    sigma[local_count:], duration[local_count:] = draw_dyadic(
-        b - local_count, y.device, generator, levels=levels
-    )
     x = (1 - coefficients(sigma, y)) * y + coefficients(sigma, y) * independent_noise
     target = independent_noise.float() - y
     if beta > 0:
-        selection = slice(0, local_count)
-        anchor = teacher_cfg(
-            teacher,
-            x[selection],
-            sigma[selection],
-            condition.take(selection),
-            negative.take(selection),
-            guidance,
-        )
-        target[selection] = (target[selection] + beta * anchor) / (1 + beta)
-    selection = slice(local_count, b)
-    target[selection] = shortcut_target(
-        ema_f,
-        x[selection],
-        sigma[selection],
-        duration[selection],
-        condition.take(selection),
-        minimum_duration=2.0 ** (-levels),
-    )
+        anchor = teacher_cfg(teacher, x, sigma, condition, negative, guidance)
+        target = (target + beta * anchor) / (1 + beta)
     return x.detach(), sigma, duration, target.detach()
 
 
-def fake_loss(f, training_batch, condition):
+def fake_loss(f, training_batch, condition, negative, *, guidance=4.5):
     x, sigma, duration, target = training_batch
-    prediction = f(x, sigma, duration, condition)
-    local_count = 3 * x.shape[0] // 4
+    prediction = guided_velocity(f, x, sigma, condition, negative, guidance)
     loss = 0.5 * F.mse_loss(prediction, target)
     return loss, {
-        "local_mse": F.mse_loss(
-            prediction[:local_count], target[:local_count]
-        ).detach(),
-        "shortcut_mse": F.mse_loss(
-            prediction[local_count:], target[local_count:]
-        ).detach(),
+        "local_mse": F.mse_loss(prediction, target).detach(),
     }
 
 
-def dmd_proxy(
-    generated, fake_velocity, teacher_velocity, noisy, sigma, *, beta, floor=1e-3
-):
-    with torch.no_grad():
-        corrected = (1 + beta) * fake_velocity - beta * teacher_velocity
-        teacher_clean = noisy - coefficients(sigma, noisy) * teacher_velocity
-        dimensions = tuple(range(1, generated.ndim))
-        normalization = (
-            (generated.detach() - teacher_clean).abs().mean(dimensions).clamp_min(floor)
-        )
-        gradient = coefficients(sigma, generated) * (teacher_velocity - corrected)
-        gradient = gradient / coefficients(normalization, generated)
-    # Check finiteness collectively after every rank finishes forward.
-    # A rank-local exception here could deadlock later FSDP collectives.
-    proxy = 0.5 * F.mse_loss(generated, (generated - gradient).detach())
-    return proxy, gradient.detach()
-
-
-def generator_losses(
+@torch.no_grad()
+def student_target_batch(
     g,
-    f,
-    target_model,
-    teacher,
+    ema_g,
+    ema_f,
     noise,
     independent_noise,
     condition,
     negative,
-    teacher_states,
-    teacher_condition,
     generator,
     *,
-    beta,
-    guidance=4.5,
+    source,
     levels=5,
-    teacher_weight=0.25,
-    shortcut_weight=0.25,
-    dmd_weight=1.0,
-    teacher_full_step_probability=0.5,
-    teacher_local_probability=0.25,
-    bootstrap_full_step_probability=0.5,
+    full_probability=0.25,
+    local_probability=0.25,
+    guidance=4.5,
+    bridge_max_step=1 / 16,
+    bridge_min_substeps=2,
 ):
+    """Refresh detached labels once per five G updates; no direct teacher call."""
     b = noise.shape[0]
-    if b % 4:
-        raise ValueError("Physical batch must be divisible by four")
-    generated = one_step(g, noise, condition)
-    sigma = 0.02 + 0.96 * torch.rand(b, device=noise.device, generator=generator)
-    noisy = (1 - coefficients(sigma, generated)) * generated.detach()
-    noisy = noisy + coefficients(sigma, generated) * independent_noise
-    with torch.no_grad():
-        fv = f(noisy, sigma, 0.0, condition)
-        tv = teacher_cfg(teacher, noisy, sigma, condition, negative, guidance)
-    direct, direction = dmd_proxy(generated, fv, tv, noisy, sigma, beta=beta)
-
-    n = b // 4
-    # Independent cached-anchor batch: do not restrict on-policy prompts to cache ids.
-    # Runtime validates n rows and matching ids in teacher_states/teacher_condition.
-    tx, ts, td, target = cached_teacher_batch(
-        teacher_states,
-        generator,
-        full_step_probability=teacher_full_step_probability,
-        local_probability=teacher_local_probability,
+    generated = one_step(g, noise, condition).detach()
+    sigma, duration = draw_dyadic(
+        b, noise.device, generator, levels=levels, full_step_probability=0.0
     )
-    teacher_loss = 0.5 * F.mse_loss(g(tx, ts, td, teacher_condition), target)
-
-    selection = slice(b - n, b)
-    bs, bd = draw_dyadic(
-        n,
+    full, local = target_kinds(
+        b,
         noise.device,
         generator,
-        levels=levels,
-        full_step_probability=bootstrap_full_step_probability,
+        full_probability=full_probability,
+        local_probability=local_probability,
     )
-    by = generated[selection].detach()
-    bx = (1 - coefficients(bs, by)) * by + coefficients(bs, by) * independent_noise[
-        selection
-    ]
-    bc = condition.take(selection)
-    target = shortcut_target(
-        target_model, bx, bs, bd, bc, minimum_duration=2.0 ** (-levels)
+    sigma, duration = torch.where(full, 1.0, sigma), torch.where(full, 1.0, duration)
+    x = (1 - coefficients(sigma, generated)) * generated
+    x = x + coefficients(sigma, generated) * independent_noise
+    # Collective EMA-G calls cover ALL rows on every rank. Local rows use dummy
+    # finite inputs until their labels are replaced below; never branch FSDP on ids.
+    target, bridge_counts = generator_bootstrap_target(
+        ema_g,
+        ema_f,
+        x,
+        sigma,
+        duration,
+        condition,
+        negative,
+        source=source,
+        minimum_duration=2.0 ** (-levels),
+        bridge_max_step=bridge_max_step,
+        bridge_min_substeps=bridge_min_substeps,
+        guidance=guidance,
+        enabled=~local,
     )
-    bootstrap = 0.5 * F.mse_loss(g(bx.detach(), bs, bd, bc), target)
-    total = (
-        dmd_weight * direct
-        + teacher_weight * teacher_loss
-        + shortcut_weight * bootstrap
+    ids = torch.nonzero(local, as_tuple=True)[0]
+    local_sigma = torch.rand(ids.numel(), device=x.device, generator=generator)
+    local_x = (1 - coefficients(local_sigma, generated[ids])) * generated[ids]
+    local_x = (
+        local_x + coefficients(local_sigma, generated[ids]) * independent_noise[ids]
     )
-    return total, {
-        "direct": direct.detach(),
-        "teacher_trajectory": teacher_loss.detach(),
-        "shortcut": bootstrap.detach(),
-        "dmd_direction_rms": direction.square().mean().sqrt(),
-        "dmd_direction_finite": torch.isfinite(direction).all(),
-        "generated_mean": generated.detach().mean(),
-        "generated_std": generated.detach().std(),
-        "teacher_full_step_fraction": (td == 1.0).float().mean().detach(),
-        "bootstrap_full_step_fraction": (bd == 1.0).float().mean().detach(),
+    # Raw AdapterEMA has no collectives. Exactly 25% local rows at the default b=8.
+    if ids.numel():
+        local_target = guided_velocity(
+            ema_f,
+            local_x,
+            local_sigma,
+            condition.take(ids),
+            negative.take(ids),
+            guidance,
+        )
+        x[ids], sigma[ids], duration[ids], target[ids] = (
+            local_x,
+            local_sigma,
+            0.0,
+            local_target,
+        )
+    return (x.detach(), sigma.detach(), duration.detach(), target.detach()), {
+        "full_rows": full.sum(),
+        "local_rows": local.sum(),
+        "short_rows": (~full & ~local).sum(),
+        "bridge_f_sample_evaluations": bridge_counts.sum(),
+        "generated_mean": generated.mean(),
+        "generated_std": generated.std(),
     }
+
+
+def student_loss(g, training_batch, condition):
+    """One differentiable G field call against cached, detached mixed targets."""
+    x, sigma, duration, target = training_batch
+    prediction = g(x, sigma, duration, condition)
+    row_mse = (prediction - target).square().flatten(1).mean(1)
+    full, local = duration == 1.0, duration == 0.0
+    statistics = {}
+    for name, mask in (("full", full), ("local", local), ("short", ~full & ~local)):
+        # Runtime all-reduces sums/counts; never average an empty subset.
+        statistics[name + "_mse_sum"] = row_mse[mask].detach().sum()
+        statistics[name + "_rows"] = mask.sum()
+    return 0.5 * row_mse.mean(), statistics
 
 
 class FieldTask(nn.Module):
@@ -966,8 +1057,9 @@ class FieldTask(nn.Module):
         if operation == "g_warmup":
             x, sigma, duration, target = cached_teacher_batch(
                 kwargs["teacher_states"],
+                kwargs["teacher_sigmas"],
                 kwargs["generator"],
-                full_step_probability=kwargs.get("full_step_probability", 0.5),
+                full_step_probability=kwargs.get("full_step_probability", 0.25),
                 local_probability=kwargs.get("local_probability", 0.25),
             )
             loss = 0.5 * F.mse_loss(self.field(x, sigma, duration, condition), target)
@@ -976,9 +1068,15 @@ class FieldTask(nn.Module):
                 "teacher_full_step_fraction": (duration == 1.0).float().mean(),
             }
         if operation == "f_loss":
-            return fake_loss(self.field, kwargs["training_batch"], condition)
+            return fake_loss(
+                self.field,
+                kwargs["training_batch"],
+                condition,
+                kwargs["negative"],
+                guidance=kwargs.get("guidance", 4.5),
+            )
         if operation == "g_loss":
-            return generator_losses(self.field, condition=condition, **kwargs)
+            return student_loss(self.field, kwargs["training_batch"], condition)
         raise ValueError(f"Unknown operation: {operation}")
 
 
@@ -1018,6 +1116,8 @@ def wrap_fsdp(model, device, *, forward_prefetch=False):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
+            cast_forward_inputs=False,
+            cast_root_forward_inputs=False,
         ),
         use_orig_params=False,
         limit_all_gathers=True,
@@ -1025,323 +1125,215 @@ def wrap_fsdp(model, device, *, forward_prefetch=False):
     )
 ```
 
-## 8. Nối model, FSDP/DDP và optimizer đúng ownership
+## 8. Runtime mới bên nhận cần triển khai
 
-Tạo **repo/project độc lập** `sd35-fake-shortcut`, package `src/sd35_shortcut/`;
-viết mới `config.py`, `backend.py`, `prompts.py`, `cache.py`, `trainer.py`,
-`checkpoint.py`, `logging.py`, `evaluation.py`, `cli.py`. Không import/copy bất kỳ
-code, utilities, tests, launcher hoặc configs của dự án training cũ. Metrics
-implementation có sẵn bên nhận có thể dùng qua interface plugin mới, ghi provenance.
-Metadata phải ghi model config thật, đặc biệt channels/dual attention; không tự
-downgrade thành SD3 Medium cũ nếu checkpoint SD3.5 không load strict.
+Tạo package `sd35_shortcut` mới từ Torch/Diffusers upstream và reference trên.
+Dependency seed: Python 3.11, Torch 2.6.0 CUDA phù hợp máy, Diffusers 0.33.1,
+Transformers 4.49.0, Sentencepiece 0.2.0, safetensors, TensorBoard, NumPy, PyYAML.
+Lock toàn bộ resolved versions trên máy nhận; metric libraries hiện có dùng qua
+adapter mới. Không cài Torch, import Torch hoặc chạy tests trên Mac authoring.
 
-Pin Torch2.6.0, Diffusers0.33.1, Transformers4.49.0 cho API code mẫu này; text tokenizer T5
-cần `sentencepiece==0.2.0`. Ghi môi trường thực tế bên nhận và xác nhận API adapter.
-Không upgrade Diffusers tùy tiện trước khi kiểm tra `time_text_embed` signature,
-activation checkpoint và weight layout. Dùng weights local sẵn có, không tải lại.
-
-Pseudo initialization (cần nối IO, checkpoint và process group; không chạy nguyên
-block này vì `load_*` là contract của backend mới):
+Modules cần có: config/schema, local asset inspection, prompt splits/encoding
+cache, teacher cache, field adapters, distributed trainer, probes, logging,
+checkpoint/export, metric adapters, paired evaluation. Các lệnh sau là **CLI
+contracts cần triển khai**, hiện chưa tồn tại trainer/CLI chạy được:
 
 ```text
-set_same_model_initialization_seed_on_every_rank(10)
-T = load_local_SD35_transformer(BF16, frozen, eval)
-G_task = FieldTask(SD35Field(load_same_transformer(FP32), shortcut=True))
-G_task.field.transformer.enable_gradient_checkpointing()  # verify non-reentrant
-EMA_G_task = independent_copy(G_task, FP32, frozen, eval, checkpointing=False)
-check_identical_logical_parameter_names_shapes_order(G_task, EMA_G_task)
-G = wrap_fsdp(G_task, local_cuda_device)
-EMA_G = wrap_fsdp(EMA_G_task, local_cuda_device)
-optimizer_G = AdamW(G.parameters(), lr=5e-6, betas=(0.9,0.999), weight_decay=0.01)
-
-# Sau P0: gather/save G snapshot chung rồi construct F trước khi fork.
-F_field = load_strict_unwrapped_G_snapshot_into_independent_SD35Field()
-target_module_names = configure_fake_lora(F_field, rank=96, alpha=96)
-F_raw = FieldTask(F_field).to(local_cuda_device)
-F_raw.field.transformer.enable_gradient_checkpointing()  # non-reentrant
-F_raw.train()  # dropout phải bằng0, không running-stat modules
-F_ddp = DDP(F_raw, broadcast_buffers=False,
-            gradient_as_bucket_view=True, find_unused_parameters=False)
-optimizer_F = AdamW([p for p in F_raw.parameters() if p.requires_grad],
-                   lr=2.5e-5, betas=(0.9,0.999), weight_decay=0.01)
-EMA_F = AdapterEMA(F_raw)  # tạo SAU DDP initialization synchronization
+python -m sd35_shortcut inspect --config config.yaml
+python -m sd35_shortcut prepare --config config.yaml
+python -m sd35_shortcut cache-teacher --config config.yaml
+torchrun --standalone --nproc_per_node=4 -m sd35_shortcut train --phase g-bootstrap --config config.yaml
+torchrun --standalone --nproc_per_node=4 -m sd35_shortcut train --phase f-warmup --config config.yaml
+torchrun --standalone --nproc_per_node=4 -m sd35_shortcut train --phase experiment --arm A --config config.yaml
+torchrun --standalone --nproc_per_node=4 -m sd35_shortcut train --phase experiment --arm B --config config.yaml
+python -m sd35_shortcut export --checkpoint RUN/last --weights ema-g --steps 1
+python -m sd35_shortcut evaluate --manifest EVAL_MANIFEST.json
+python -m sd35_shortcut compare --a A/scores.jsonl --b B/scores.jsonl
 ```
 
-`configure_fake_lora` là implementation LoRA riêng trong code mẫu, không phải PEFT
-file format. Save danh sách module names và shapes thực tế. Không dùng standard
-PEFT loader để bỏ qua keys custom; nếu bên nhận dùng PEFT thay code mẫu, phải
-preserve target modules/rank/alpha/dropout và duration MLP, rồi kiểm tra numerical
-identity. F frozen base bắt nguồn **G sau P0**, không SD3.5 T gốc và không checkpoint
-distill có sẵn. Lưu base này một lần, reuse theo hash cho tất cả adapter checkpoints.
+`inspect` chỉ đọc local metadata: xác nhận SD3.5 Medium base, 16 latent channels,
+MMDiT/dual attention/qk_norm, patch size và time scale 1000; record model revision,
+config và hashes. Require assets local, không lưu token trong config/log/manifest.
+Text encoding và VAE/evaluator chạy riêng khỏi training loop. Cache 8192 T5
+embeddings có thể tốn nhiều GiB; dùng disk/memmap và stream từng batch, không
+load toàn bộ text cache lên GPU. Teacher states cũng đọc theo chunks.
 
-### Adapter shortcut phù hợp MMDiT/SD3.5
+Load T frozen BF16 eval. F là **native teacher clone độc lập**, inject FP32 LoRA.
+G là native clone độc lập FP32, thêm StepConditioning; EMA-G độc lập FP32 cùng
+structure. Assert không alias trainable tensors/storage G↔F↔T; F base hash bằng T;
+F không có duration modules. Native unfused attention processor, LoRA discovery
+fail rõ nếu khác kiến trúc pinned. Record actual target names/trainable count;
+không bỏ context/dual branches âm thầm. Không adapter dropout/mutable statistics.
 
-Giữ nguyên transformer từ config local: joint attention giữa image/text, dual
-attention ở những block mà checkpoint khai báo, QK normalization, patching và
-positional embeddings. Không hardcode số layers/width thành một bản SD3 khác.
-Ở512, VAE downsample8 → latent64×64; nếu patch_size=2 thì1024 image tokens.
-Kiểm tra config thật và positional crop support; không resize pretrained weights
-cho vừa input. Token sequence conditioning theo pipeline thật, không tự concatenate
-CLIP/T5 kiểu UNet cross-attention.
+G và EMA-G: **FSDP1 whole FieldTask FULL_SHARD**, cùng shard layout/device;
+optimizer G tạo sau wrap. Uniform requires_grad trong mỗi FSDP instance; EMA-G
+all frozen. BF16 compute, FP32 persistent parameters/moments/EMA/reduction.
+F không dùng FSDP helper vì mixed frozen/trainable: dùng DDP(FieldTask) và optimizer
+chỉ FP32 LoRA. `find_unused_parameters=False` chỉ sau gradient audit; final unused
+context query đã excluded. `broadcast_buffers=False` nếu không mutable stats.
+F raw module dành no-grad calls/EMA, F DDP forward dành differentiable loss.
 
-Embedding sigma pretrained vẫn nhận `1000*sigma`. Thêm
-`E_d(d)=MLP(Fourier(1000*d))-MLP(Fourier(0))` vào output `time_text_embed`, trước
-các AdaLN modulation và final norm. MLP output layer khởi tạo0: toàn transformer
-có hành vi base tại khởi tạo cho mọi d, sau đó mới học finite-duration field.
-`E_d(0)=0` luôn: **duration branch** không đổi local path; backbone/LoRA vẫn có
-thể đổi local field khi train. Không thay sigma bằng sigma-d, không thêm d vào
-text embeddings hoặc viết lại SD35AdaLayerNormZeroX.
+FSDP input casting bị tắt trong helper: **không cast target/sigma/loss inputs sang
+BF16**. SD35Field tự cast hidden/text inputs theo compute weights; output/CFG/MSE
+FP32. Dùng BF16 autocast cho model forward; ngoài autocast giữ target builder,
+Euler state updates và loss statistics FP32. Audit actual tensor dtypes trên GPU.
+Enable native non-reentrant block checkpointing; nhánh duration chạy trước block
+checkpoint. Không recompute whole wrapper bằng reentrant checkpoint làm mất context.
 
-Zero init khiến layer đầu duration MLP có thể grad0 ở first step; layer cuối phải
-có gradient trên d>0. LoRA B phải có gradient khi A random/B0; LoRA A có thể grad0
-lúc đầu. Log riêng hai trường hợp này, không suy “model không học” từ một tensor.
+Raw F và functional EMA-F không gọi concurrent. AdapterEMA thay chỉ LoRA tensors,
+shares immutable base và scalar λ. Freeze bằng no optimizer step/no EMA update,
+giữ parameter names/requires_grad set để shadow mapping ổn định. Sau fade không
+backward F; λ=0 bỏ adapter branch. Set λ cho model trước cả online/EMA-F query.
 
-F LoRA96 áp q/k/v/out của image attention, context k/v và q/out khi context output
-được dùng; có cả **attn2** của dual-attention blocks và image/context FF Linear.
-Block cuối `context_pre_only=True` bỏ context output: không LoRA hóa `add_q_proj`
-của block đó. Không LoRA hóa AdaLN modulation, input/output heads hoặc original
-time/text projections. F giữ duration MLP trainable riêng. Danh sách actual module
-paths/counts/shapes phải được export; không diễn giải rank96 là96 parameters.
+## 9. Update transaction và distributed correctness
 
-Không bật QKV projection fusion sau LoRA injection: code mẫu dựa trên các Linear
-độc lập, không phải fused/custom attention processor adapter. DDP `find_unused=False`
-chỉ dùng sau audit mọi local/finite/dual path và backward không có trainable
-`grad=None`; nếu local checkpoint/processor khác source pin, fail compatibility
-hoặc dùng detection trong smoke rồi sửa danh sách modules. Không âm thầm tắt các
-dual layers để vừa VRAM.
+Trước phase/fork, broadcast resolved config/hash/decision. Mọi rank kiểm tra cùng
+world size, batch64, microbatch chia hết4, source whitelist, cache geometry/sigmas,
+parameter ownership và prompt cursors. Exception trên rank0 phải thông báo/abort
+đồng bộ; không để ranks khác chờ collective.
 
-Nguồn: [SD3 transformer](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/transformers/transformer_sd3.py),
-[joint block](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/attention.py),
-[joint attention processor](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/attention_processor.py).
-Vị trí duration injection và lựa chọn LoRA là thiết kế mới dựa trên các API đó,
-chưa được kiểm chứng bằng GPU.
+Mỗi refresh dựng global64 targets bằng `student_target_batch` theo từng microbatch.
+Builder chạy no_grad; online G và EMA-G FSDP calls **ngoài differentiable G loss**.
+Teacher không truyền vào builder/loss. Cache x/sigma/d/label FP32 detached,
+condition references, prompt IDs/noise hashes, generation k_G, λ, EMA revisions,
+source, RNG và replay cursor. Cache64×2 latents chỉ~32MiB; text có thể stream CPU.
+Replay cùng row order5 updates; A/B dùng riêng namespace nhưng matched prompt/
+noise RNG streams. Không reuse target tensors giữa arms vì states khác nhau.
 
-G/EMA-G: FSDP1 `FULL_SHARD`, một whole `FieldTask` mỗi wrapper, không nested auto-wrap
-trong bản đầu. G master weights/AdamW moments/EMA-G logical shards FP32, forward
-BF16. F: frozen BF16 base replica + trainable FP32 LoRA/duration, DDP all-reduce chỉ
-trainables. Không wrap F bằng FSDP `use_orig_params=False` với mixed requires_grad;
-không thêm manual BF16 optimizer/master copy vào G FSDP vì sẽ nhân đôi state.
+A cần2 EMA-G calls; B cần1 EMA-G tail và rank-local F loops. **Mọi rank gọi cùng
+số FSDP collective forwards**, kể cả dummy finite inputs của local rows trước
+khi overwrite bằng local F labels. Không branch FSDP call theo active IDs hoặc
+số Euler loops khác nhau. F loops chỉ raw F/AdapterEMA, không collectives. Audit
+min2/max8 counts và effective CFG branches; đếm discarded dummy EMA-G work vào
+profiling. Local target là combined F_CFG, không conditional F hay double CFG.
 
-EMA-G và G phải cùng flattening/order/world size. Update EMA-G chỉ ngoài FSDP
-forward/backward/full-param contexts khi persistent shards đã được trả về. Dùng
-`update_ema_shards` sau successful optimizer_G.step. Với F, `AdapterEMA.update`
-sau optimizer_F.step; checkpoint shadow dictionary FP32. Frozen F base không cần
-EMA vì bất biến. Functional target calls bỏ qua DDP, không optimizer/hook gradients.
+Microbatch gradient gọi outer task:
+`g_task(operation='g_loss', training_batch=batch, condition=cond)` hoặc
+`f_task(operation='f_loss', training_batch=batch, condition=cond, negative=neg, guidance=4.5)`.
+Không bypass differentiable G qua `.module`; một outer FieldTask sở hữu graph.
+G loss một field call; F loss một combined2B call. Targets detached, G không có
+backward qua F/T/EMA; F không có backward qua G.
 
-**Một outer FSDP forward cho toàn bộ G loss**, gọi:
+G accum2: loss/2, **FSDP sync mỗi microbatch**, không G `no_sync` vì có thể giữ
+full gradients gây OOM. F DDP có thể `no_sync` cả forward/backward ở microbatch
+chưa cuối. Sau đủ64 rows: all-reduce finite decision, backward/skip cùng lịch;
+audit gradient finite toàn ranks, G FSDP `.clip_grad_norm_` để norm shards đúng,
+F replicated trainables dùng norm tương ứng. Step và EMA đúng một lần khi success.
+Không rank-local raise/return trong lúc ranks khác đang forward/backward collectives.
 
-```python
-with torch.autocast("cuda", dtype=torch.bfloat16):
-    loss, diagnostics = G(
-        operation="g_loss",
-        condition=condition,
-        f=F_raw,
-        target_model=EMA_G if arm == "A" else EMA_F,
-        teacher=T,
-        noise=noise,
-        independent_noise=independent_noise,
-        negative=negative_condition,
-        teacher_states=teacher_states,
-        teacher_condition=teacher_condition,  # independent cached-anchor ids
-        generator=g_aux_rng,
-        beta=beta,
-        teacher_full_step_probability=0.5,
-        teacher_local_probability=0.25,
-        bootstrap_full_step_probability=0.5,
-    )
-```
+F transaction tại k_G%5=0 trước fade. Nếu F update fail, retry/stop đồng bộ trước
+khi tiến G; không coi đó là successful F update. G skip giữ target cache/replay
+position, không advance counters; repeated nonfinite thì save failure và stop.
+Schedules β/λ/LR/EMA/checkpoints dùng successful counters, attempted steps log riêng.
+Resume phải nhớ F boundary đã hoàn tất hay chưa, tránh update F lần2.
 
-`FieldTask` giữ ba differentiable G queries bên trong một FSDP lifetime, tránh
-ba outer G forwards trước một backward. F training tương tự:
+G EMA update từ **FP32 online optimizer shards** ngoài forward, cùng layout;
+không từ gathered BF16 weights. Log master nonzero delta và BF16-visible changed
+fraction. F EMA FP32, reset validated online F sau P1 rồi shared fork. Scalar λ
+không nằm trong state_dict mặc định: lưu/restore trước query F hoặc EMA-F.
 
-```python
-with torch.autocast("cuda", dtype=torch.bfloat16):
-    training_batch = fake_targets(
-        G, EMA_F, T, noise, independent_noise, condition, negative_condition,
-        f_aux_rng, beta=beta,
-    )
-    loss, diagnostics = F_ddp(
-        operation="f_loss", condition=condition, training_batch=training_batch
-    )
-```
+Save giữa replay block phải lưu detached target batch, condition references và
+cursor. Regenerate labels từ G/EMA hiện tại làm thay đổi experiment, không gọi
+exact resume. Strict scientific ID/config/model/schema check; revision cũ fail.
 
-Activation checkpoint phải **non-reentrant**; F frozen input không có requires_grad,
-reentrant checkpoint có thể làm mất LoRA gradients. Diffusers0.33.1 default dùng
-non-reentrant nhưng phải xác nhận smoke. Code duration context phù hợp bản này vì
-checkpoint nằm ở transformer blocks, sau khi time/duration embedding đã được tính.
-Không checkpoint toàn bộ SD35Field bằng một wrapper khác khiến duration context
-đã reset khi recompute. Không multi-thread/concurrent-call cùng một FieldTask.
+## 10. Logging, TensorBoard và profile
 
-### Optimizer step và accumulation
+Rank0 append/flush `metrics.jsonl` và TensorBoard từ cùng payload; rank-local
+errors/cursors ghi riêng. Nonfinite JSON dùng null+finite flag, không invalid NaN.
+Mỗi row có phase/arm/k_G/k_F/attempt/replay position/target revision/λ/β/freeze
+state/walltime/GPU time/config hash/code commit.
 
-Mỗi optimizer window giữ beta/loss weights, target EMA và sampled data policy cố
-định. Mỗi microbatch loss mean chia cho `accumulation_steps`. Với G FSDP, mặc định
-**sync/reduce-scatter mỗi microbatch**, giữ gradients sharded và chỉ step một lần
-khi đủ batch64. `FSDP.no_sync()` có thể giữ full unsharded gradients qua accumulation,
-tốn nhiều VRAM; không dùng mặc định ở512. F DDP no_sync bao cả forward/backward
-microbatch chưa cuối; trainables nhỏ hơn. BF16 không cần GradScaler.
+Scalar groups cần có:
 
-Sau **tất cả ranks** hoàn thành forward, all-reduce finite flag của loss và DMD
-direction trước backward. Không rank-local raise/skip trước collective tiếp theo.
-Sau backward, G dùng `G.clip_grad_norm_(10)` cho norm sharded đúng toàn model; F
-dùng `clip_grad_norm_` trên trainables đã DDP sync. Kiểm tra finite gradient norm
-collectively rồi mới step/EMA/counter. Skip đồng bộ cả window khi nonfinite; clear
-grads, ghi failure reason, không nan_to_num hoặc advance optimizer moments/counters.
-Sau3 failed attempts liên tiếp save failure state của cả ranks và abort.
+- Loss tổng; full/local/short MSE sums và row counts; F local MSE; LR G/F.
+- Grad norm trước clip; master delta absolute/relative/nonzero; BF16-visible
+  changed fraction; online→EMA drift; EMA-F→T relative field RMS.
+- Latent mean/std/range/nonfinite; skips/reasons; actual64/16full/16local/32short.
+- New target rows và replay row presentations; target age; F cadence;
+  actual λ target strength; beta và teacher coefficient/RMS/mixing delta.
+- Call counts T/F/G/EMA theo target generation/backward/probe; denoising
+  evaluations và conditional branches. Teacher50 là50 CFG calls/100 branches;
+  standalone G export là1 conditional transformer call.
 
-Beta của cycle lấy từ k_G trước F, giữ nguyên khi G retry. Nếu G fail sau F success,
-retry G, không chạy F thêm trong cùng slot; checkpoint lưu `next_actor`/cycle phase.
-F update thất bại retry đúng slot F. LR warm-up đếm successful updates của actor ở
-phase hiện tại; trong P2 `lr = peak*min(1,(k_actor+1)/20)`. Không scale LR tuyến
-tính theo world size/batch.
+Reduce sums/counts, không mean empty subset thành NaN. Missing metric ghi
+unavailable, không 0. Không log F-shortcut loss vì F không học shortcut.
 
-## 9. RNG, matched fork và noise coupling
+Profile every10G: target refresh (G endpoint, F bridge, EMA-G tail), transfer/cache
+load, G forward/backward/reduction/AdamW, F forward/backward/AdamW, EMA, checkpoint/
+probe I/O. Median/p90, peak allocated/reserved VRAM, GPU utilization và GPU-giờ.
+CUDA events cho kernels, wall time cho I/O/collectives; không synchronize từng
+layer để log. Báo target refresh amortized /5, F cost /5 và whole cycle cost;
+không hứa tốc độ từ riêng G loss forward time.
 
-Tách generators: model initialization, data shuffle, G noise, F noise, G auxiliary,
-F auxiliary, probe/eval. Per-rank data shards disjoint; global shuffle/cursor chung.
-Sau fork tạo các streams A/B từ cùng seed, rank, actor và attempted-update index;
-**không đưa tên arm vào seed**. EMA target calls deterministic, dropout0, không
-tiêu thụ training RNG. Probe/sample giữ và restore mọi training RNG.
+Probes every50 updates trên validation/fixed seed: F local tracking so T, field
+RMS distance, EMA-G composition residual, one-step teacher endpoint MSE và primary
+image score. Fixed8 uncurated images at150/300; 2/4/8-step diagnostics16 val prompts
+riêng. Final test không dùng trong training/tuning dashboards. Giữ probe scalars
+và fixed hashes, không dump full activations/gradients hoặc vô số sample images.
 
-Teacher batch riêng có n=B/4 states và `teacher_condition` đúng ids, không lấy
-positive condition từ on-policy batch khác của reLAION. Runtime validate shapes,
-caption ids và cache hashes trước forward; validate failure phải đồng bộ mọi rank.
-Noise cho re-noising
-F phải độc lập initial noise đã tạo y_G. DMD và bootstrap cùng dùng fresh on-policy
-G endpoints, không dùng teacher endpoint giả làm current generated sample.
+Trước fork, kiểm tra F bridge midpoint maxstep1/16 vs1/32 trên16 val states cùng
+λ: normalized RMS difference và finiteness. Nếu difference>0.05×finer-midpoint RMS,
+flag coarse; refine chung trước fork hoặc stop. Ngưỡng heuristic, không proof
+Euler exact. 2..8 F calls khác teacher50; không gọi bridge là exact teacher path.
 
-P0 gọi `G(operation="g_warmup", teacher_states=..., condition=teacher_condition,
-generator=..., full_step_probability=0.5, local_probability=0.25)`; P2 map config
-`g_teacher_*`/`g_bootstrap_*` tới keyword args tương ứng của `generator_losses`.
-Validate probabilities trong[0,1], full+local<=1 và dyadic levels>=1 trước collective
-forward; ghi actual full/local/short counts. F giữ uniform dyadic hierarchy;
-không truyền G full-step bias vào F sampler rồi làm lệch mục tiêu tracking đã chốt.
+## 11. Checkpoint, freeze và minimal retention
 
-Khóa A/B bằng một shared-init manifest và một config diff chỉ có source target và
-run directory/name. Cache/prompts/world-size/batch/precision/LR/checkpoint weight
-choice/optimizer initialization/EMA shadows đều phải bằng nhau. F sẽ khác giữa A/B
-sau training vì G endpoints khác; đó là hậu quả của treatment, không ép F tiếp tục
-giống nhau để làm mất on-policy tracking.
+Shared P0/P1 init bảo vệ riêng. Mỗi arm giữ latest1 rolling checkpoint interval150G
+và selected final EMA-G export; failure/last-good manifests bảo vệ. Atomic temp→
+verify hashes→completion marker→replace; prune chỉ sau save hoàn tất. Không prune
+assets/checkpoint của run khác. Không commit weights/data/logs/images/tokens lên GitHub.
 
-## 10. Logging/TensorBoard và profile để kiểm tra tốc độ thật
+Full resume lưu G/F/EMA-G/EMA-F, cả optimizer states FP32; phase/counters/boundary/
+replay; per-rank CPU/CUDA RNG và prompt cursor; cached labels/references nếu replay
+active; β/λ/fade event/gate history/frozen adapter hashes; architecture/duration/
+LoRA targets/versions/world size. F base có thể rehydrate từ local T nếu strict
+hash check, nhưng chỉ LoRA state_dict thiếu λ/freeze event thì chưa đủ resume.
+A/B khởi đầu cùng shared init, G optimizer mới; F optimizer giữ nguyên. Arm resume
+phải restore optimizer/counters, không warm-up/reset lại.
 
-JSONL mỗi rank, tổng hợp rank0; TensorBoard trên rank0, không upload logs tự động.
-Ghi phase/P0_G/P1_F/P2_G/P2_F, arm, k_G/k_F, attempted updates, effective batch64,
-samples seen, LR, beta, target source và successful/skipped events. Ghi F local
-MSE, F shortcut MSE, held-out normalized errors theo sigma; G direct/teacher/shortcut
-losses, DMD-direction RMS, latent mean/std, full G global grad norm, F trainable
-grad norm, clip rate, số trainables và d/sigma histograms.
+Recipient smoke save→restart→one update trên **4GPU strategy thật**, so continuous
+run. Thêm shortened artificial fade smoke để kiểm tra freeze, λ0F=T_CFG, resume
+λ/labels/EMA và standalone G export/reload. Shortened fade chỉ numerical smoke,
+không trộn vào scientific A/B run. Record actual tolerances, không hứa bitwise
+với nondeterministic kernels. Đổi world size tạo lineage mới, không exact resume.
 
-Ghi riêng full-interval teacher/shortcut losses bằng sum/count qua ranks, cùng
-`teacher_full_step_fraction`/`bootstrap_full_step_fraction`; empty subset không
-được mean thành NaN rồi skip training. Đếm mọi differentiable G endpoint ởDMD là
-1NFE; log1/2/4/8-step diagnostic results ởtags khác nhau. Không gộp metric của nhiều
-NFEs thành một score hoặc tự chọn steps theo từng image để cải thiện kết quả.
+Export inference G/EMA-G config+duration MLP+source hashes+weight choice;
+strict loader dựng SD35Field. `one_step` rồi native VAE decode:
+`vae.decode(latent/vae.config.scaling_factor + vae.config.shift_factor)`.
+Native16 channels/64 spatial, không SDXL scale hoặc latent clipping. Export không
+load F/T; không hidden rollout hoặc external CFG. Profile đúng1 conditional call;
+metadata primary inference/eval1 và optional diagnostic2/4/8 support.
 
-Master update diagnostics: RMS delta, relative delta norm và nonzero delta fraction
-cho G **FP32 master shards**, F LoRA và duration MLP; không log BF16 shadow delta rồi
-kết luận optimizer đứng. Đo mỗi10 updates bằng fixed sampled parameter elements
-trước/sau optimizer step; ghi sample ids/counts và gọi là sampled statistics.
-Không clone cả model FP32 mỗi update hoặc copy nó về CPU chỉ để log delta.
-Phân tích gradient interference chỉ thêm ở sparse probe
-khi có budget và gọi rõ output-space hay parameter-space; không dùng cosine giữa
-hai vector ở khác state/time và diễn giải là parameter gradient alignment.
+## 12. Evaluation: nhanh nhưng có ý nghĩa
 
-Timing riêng: data/cache IO, G endpoint generation, F target build, F forward/backward,
-teacher CFG, G teacher anchor, G bootstrap target, G forward/backward, optimizer,
-EMA, probe, image decode và checkpoint. Dùng CUDA events hoặc synchronized sparse
-profiling; ghi profiling overhead. All-reduce max seconds/peak VRAM qua ranks.
-Logical forward counts ghi actor, batch size và CFG conditional/unconditional
-evaluations; tách activation-checkpoint recomputations khi profiler đo được.
+Lock primary trước fork: HPSv2.1 nếu checkpoint/version/preprocessing/scale verified;
+nếu ImageReward usable thì có thể chọn IR chung trước fork. Chỉ CLIP-S usable có
+thể làm semantic screening, không claim aesthetic quality. Secondary missing ghi
+unavailable. Dùng metric libraries đã có qua adapters mới và đầy đủ provenance.
 
-Warm smoke phải đi qua **P2 có beta>0, d=1 và cả nguồn EMA-G/EMA-F**, không chỉ P0.
-Profile b8/accum2 rồi b16/accum1 ở512 khi tất cả T/G/F/EMA và AdamW moments đã allocate; peak
-VRAM trước optimizer state allocation không chứng minh cả run vừa. Run A/B thật
-300G với ramp100 để có200G ở beta_max, không chỉ train đến cuối ramp rồi kết luận.
+Rows: T **50steps/CFG4.5**, shared init G **1NFE**, A300G **1NFE**, B300G **1NFE**,
+native512 tất cả. T128 validation cached chỉ là val reference/gate, không so với
+student test mean. Final students test512 held-out reLAION×2 fresh noise seeds =
+1024 images/model, matched prompt IDs/noise hashes/decoder/resize/crop/evaluator.
+Dùng **EMA-G** prechosen cho cả A/B; online G phụ, không pick theo arm/prompt.
+Muốn teacher-vs-student final mean thì generate teacher trên đúng test pairs.
+Không dùng final test để tune/gate/chọn checkpoint; test noise khác train/cache/probe.
+Few-step báo riêng; B4-step>A1-step không chứng minh one-step bridge tốt hơn.
 
-Ước lượng ETA sau10 finite P2 cycles, báo median/p90 F/G và GPU-giờ
-`world_size*wall_seconds/3600`; cộng chi phí cache/P0/P1, eval và checkpoint. Không
-hứa thời gian cụ thể trước profile. Cache/warm-up là chi phí dùng chung, báo riêng
-và phân bổ rõ nếu so cost per arm. Baseline A có G-EMA FSDP target all-gather còn B
-target F LoRA; throughput có thể khác dù logical target NFEs giống nhau.
+T reference trong project dùng CFG và Euler accumulation FP32 từ BF16 field
+predictions, cùng cache policy §5. Native stock BF16 pipeline có rounding khác;
+record numerical policy, optional đo stock50 baseline riêng. **Native sigma grid
+không đồng nghĩa bitwise stock-pipeline parity.** Paper parity vẫn unverified cho
+tới khi audit cùng sampler, precision, prompts, resolution và evaluator.
 
-TensorBoard images chỉ8 fixed prompts G/EMA-G/teacher ở milestone150/300; latent
-metrics/probes mỗi50. Không lưu full image batch mỗi step. Viết logger mới trong
-project này, không reuse logger code của repo cũ; không giả `k_G` cho warm-up F.
+Positive early signal: B−A primary held-out metric positive paired95% CI, no clear
+secondary/uncurated image regression, gates pass, actual one-step export. Loss/MSE
+giảm không chứng minh ảnh đẹp. Pilot positive chưa kiểm chứng fade đến0 hoặc
+seed robustness; pilot negative chưa bác bỏ toàn method. Báo GPU-giờ/target NFEs/
+new target rows/skips; equal updates khác equal compute. Nếu cần compute-matched
+comparison, thêm control A với budget compute tương đương, report riêng.
 
-## 11. Checkpoint/resume/export và retention
-
-Giữ shared-init sau P1 cố định, một latest atomic checkpoint mỗi arm, một selected
-final G export. Checkpoint mốc150 cũ chỉ prune sau khi checkpoint mới complete và
-manifest hash đã xác nhận; protect `.pin`, failures, source assets và selected export.
-Không nhân bản frozen F base hoặc teacher mỗi checkpoint. Không ghi weights/cache/
-metrics output vào Git.
-
-Schema mới cần chứa: model config/sigma convention/duration encoding; G/EMA-G FP32
-shards; F trainable tensors, target module list, rank96/alpha96, frozen-base hash;
-EMA-F shadows; optimizer_G/F states, rank/world size and partition layout; phase,
-actor slot/counters/ramp/LR schedule; RNG từng stream; prompt order/cursor; cache
-hashes, source base and G-P0 snapshot hashes; environment/commit và validation gates.
-
-Use Torch2.6 FSDP sharded state-dict + optimizer-state API hoặc DistributedCheckpoint;
-không `torch.save(G.state_dict())` trên rank0 rồi cho rằng đó là full portable weights.
-Save/resume là collective, phải có đủ shard files/checksums/complete marker. Resume
-đúng world size/strategy; đổi topology là conversion riêng, không silent resume.
-Test resume sau P1 và một complete P2 cycle cho cả A/B. Kiểm tra tiếp theo cùng
-batch/noise/LR/beta/loss trong tolerance BF16; preserve tensor dtypes và optimizer
-ownership. Frozen base hash mismatch hoặc missing adapter key/shape phải fail.
-
-Shared-init fork **khác exact resume**: tạo optimizers mới, reset experiment clocks,
-giữ G/F/EMA đã warm. Mỗi arm đều cùng policy này. Không resume optimizer cũ của A
-vào B. Khôi phục exact checkpoint phải restore moments/counters/RNG/cycle.
-
-Export G chỉ inference weights/config/duration embedding, G/EMA-G weight choice và
-nguồn train. Loader mới dựng SD35Field trước khi load strict; pipeline SD3 thường
-không tự nhận duration embedding. Inference chỉ `one_step(G,z,c)` rồi VAE decode;
-F/T không cần load. “One step” phải đo **1 conditional transformer evaluation**,
-không thêm unconditional CFG call, hidden F rollout hay nhiều G calls.
-
-Export metadata ghi `primary_inference_steps=1`, externalCFG1 và duration support.
-`sample_shortcuts(...,steps=2/4/8)` là sampler diagnostic tùy chọn của cùng model;
-1-step loader vẫn phải hoạt động độc lập. Reload kiểm tra1-step output/NFE thật,
-không chỉ kiểm tra một pipeline fallback nhiều bước.
-
-## 12. Evaluation để biết có work và cách so paper
-
-Chốt primary metric **trước fork** dựa trên metric bên nhận đã có: default
-**HPSv2.1**, kiểm tra checkpoint/version/scale trước khi lock. Nếu HPSv2.1 chưa
-usable nhưng ImageReward có provenance hợp lệ, đổi chung sang ImageReward trước
-fork và ghi rõ choice;
-CLIP-S và metric còn lại là secondary. Nếu chỉ có CLIP-S thì ghi đó là primary
-semantic score và không claim aesthetic quality từ CLIP-S riêng. Không cài/tải lại
-ImageReward/HPS chỉ vì tên metric xuất hiện trong docs; dùng adapters với version,
-checkpoint revision, preprocessing, score scale và aggregation thực tế.
-
-Reference rows: base teacher32 uniform sigma, base teacher official sampler nếu
-có, G sau P0/P1 (1NFE), A300G (1NFE), B300G (1NFE), **native512 tất cả**.
-Teacher reference ở128 validation prompts có sẵn; không bắt generate1024 teacher
-images trước khi có screening. Nếu báo teacher vs student trên final test, phải
-generate teacher cùng test pairs, không so validation mean với test mean.
-Dùng **EMA-G** cho cả A/B theo
-policy định trước; online G báo phụ, không pick G/EMA theo từng prompt hoặc theo arm.
-Test512 **reLAION held-out** prompts ×2 noise seeds mới =1024 ảnh mỗi student model;
-cùng prompt ids/noise hashes,
-resize/crop/decoder/evaluator. Lưu per-sample primary + secondary scores, không chỉ
-mean. Noise test khác cache/probe/training. Validation128 dùng gates; final test
-không dùng tune beta/LR/loss weights/chọn milestone sau khi xem kết quả.
-
-Primary test và so A/B luôn **1NFE**; few-step dùng16 validation prompts chung,
-báo riêng2/4/8NFE và đúng cost. B4step>A1step không chứng minh B tốt hơn ởone-step.
-Không chọn final export chỉ vì few-step metric cao trong khi one-step thất bại.
-
-Điều kiện tín hiệu dương: B tốt hơn A trên primary **held-out image** metric với
-paired CI và không có degradation rõ trên secondary/ảnh uncurated; tracking F đạt
-gate, không collapse, NFE1 thật. Teacher endpoint error và shortcut residual là
-diagnostics riêng, không dùng latent MSE giảm để chứng minh ảnh đẹp hơn. Chi phí
-ngang số successful updates nhưng báo GPU-giờ/samples/skips để không giấu khác cost.
-
-Paired bootstrap **theo prompt**: trung bình2 noise scores trong mỗi prompt rồi
-resample prompt ids chung cho A/B. Code tham khảo (thực thi trên máy bên nhận):
+Paired CI theo prompt: trung bình2 noise scores rồi resample prompt IDs chung:
 
 ```python
 import numpy as np
@@ -1371,115 +1363,74 @@ def paired_prompt_ci(scores_a, scores_b, *, seed=2026, draws=10000):
     return {"delta_B_minus_A": float(delta.mean()), "ci95": [float(low), float(high)],
             "prompts": len(delta), "bootstrap_seed": seed, "draws": draws}
 ```
+CI chỉ đo uncertainty across prompts của hai checkpoints, không training seed
+variance. Nếu có tín hiệu, repeat A/B main seed11 từ shared warm init với cùng
+protocol; đó là replication conditional on warm init. End-to-end robustness cần
+lặp P0/P1. Không chỉ test B rồi so số paper ở setting khác.
 
-CI này đo uncertainty trên prompts của hai checkpoint cụ thể; nó không đo variance
-giữa training seeds. Nếu có tín hiệu, lặp P2 A/B với training seed11 từ cùng shared
-init, giữ test/metric policy. Báo đó là replication conditional on shared warm init,
-không giả là hai independent end-to-end runs. Nếu cần claim end-to-end robustness,
-lặp cả P0/P1 sau. Screening300G âm tính không đủ bác bỏ toàn bộ phương pháp.
+FID1024 chỉ exploratory, không so FID10K/50K. Sau screening, để so paper chạy cùng
+COCO2014-val10K/native512 protocol cho A/B, T và baseline checkpoint thật nếu có.
+Record reference/split/count/captions/seed/noise/resize/crop/feature checkpoint/
+evaluator commit/aggregation. Paper khác resolution/data/CFG/prompts/evaluator
+thì reported scores là context; re-evaluate checkpoint bằng common protocol mới
+là empirical comparison. Không lấy FID SDXL17.80 hoặc FD-loss ImageNet FID làm mốc
+SD3.5 COCO. Thiếu audit thì `paper_protocol_equivalence=unverified`.
 
-FID trên1024 ảnh chỉ exploratory, không so trực tiếp FID-10k hay FID-50k paper.
-Khi B qua screening, chạy A/B final **cùng COCO2014-val10k, native512**
-với cùng protocol, full metrics/provenance. COCO chỉ eval, train vẫn reLAION. Reference
-real data/split/hash, image resize, feature checkpoint và count phải matched. Việc
-so một SD3.5-512 score với SDXL native1024→512 score không cho attribution phương pháp.
-Nếu muốn so FD-loss/Decoupled trên SD3.5, cần checkpoint/baseline **cùng backbone**
-và đo lại; không tự điền số baseline từ ImageNet hoặc bảng SDXL.
+## 13. Method checks phải làm trên GPU bên nhận
 
-Nếu muốn kiểm tra trực tiếp fake bridge vs **frozen-teacher** trajectory, thêm arm C
-sau screening: cùng on-policy states và losses, teacher integrate mỗi half interval
-bằng đủ Euler substeps, thay target source; ghi extra NFEs. Không dùng hai local
-teacher calls cho một d=1/2 rồi gọi đó là accurate teacher finite shortcut. Arm A
-hiện tại kiểm tra self-vs-fake, chưa chứng minh superiority so teacher trajectory.
+1. Native50 sigma grid, sign và scheduler Euler update với FP32 sample/model output;
+   compare native pipeline theo declared precision/tolerance, report rounding
+   differences; VAE scale/shift, actual51 nodes, local/full cache labels đúng.
+2. Duration zero-init giữ pretrained prediction; d0 branch cancel sau training;
+   duration gradients thật dưới non-reentrant checkpointing; G d1 usable.
+3. F zero-B hoặc λ0 bằng T_CFG4.5; shrink frozen adapters về0 tiến tới T. Combined
+   F_CFG backward finite, useful LoRA projections có gradients; F không duration.
+   Master/moments/EMA FP32, cached targets không bị FSDP cast BF16.
+4. Constant/linear velocity toy fields verify Euler sign, model midpoint, child
+   local boundary, min/max substeps và B `(x-end)/d`; targets detached, independent
+   re-noising noise. Không coi instantaneous F×d là finite shortcut.
+5. Exact64/16/16/32; accumulation mean, sync/clip/step và gradient ownership đúng;
+   same FSDP collective call order khi rank-local active masks khác nhau.
+6. k0..195 có40 successful F updates; cache replay5G; β≤.01 chỉ F trước freeze;
+   main G không teacher/DMD calls; F optimizer và EMA không đổi sau freeze.
+7. λ tại200/300/700/1200 =1/.9/.5/0 nếu gate pass200; resume freeze/cache cursor không
+   thêm F step; standalone export/reload G đúng1 conditional NFE, không load F/T.
+8. Disjoint prompt/noise splits, matched per-sample metrics, unavailable metrics
+   explicit, paired CI by prompt ID, không duplicate prompt leakage.
 
-## 13. Lộ trình triển khai và contract CLI
+4H100 smoke ghi actual memory/timings. b8/accum2 là proposal, chưa verified fit.
+Không chạy dài trước save/resume/export/cadence/freeze smoke. Mac authoring chỉ
+static theo yêu cầu chủ project; không Torch imports, tests, training hoặc downloads.
 
-Bên nhận viết theo thứ tự, không chạy dài trước khi có save/resume:
+## 14. Sources và report bên nhận
 
-1. Project mới + backend flow SD3.5 + reLAION reader/conditioning cache + duration embedding.
-2. Teacher cache512px, disjoint split/hash và teacher-quality gate.
-3. G warm-up, F LoRA96 warm-up và tracking gates.
-4. G FSDP / F DDP / two EMA modes, finite/skip/accumulation, checkpoint+export.
-5. Shared-init fork lock, A/B300G, TensorBoard/profile, paired eval/plugins.
+- [Representation Fréchet Loss v1, B.4/Table B.3](https://arxiv.org/html/2604.28190v1#A2.SS4),
+  [official repo pinned](https://github.com/Jiawei-Yang/FD-Loss/tree/5c03b8112fec8b9432631e4ce053c0d918cc24bc).
+  Config context; experiment này không implement FD loss.
+- [Shortcut Models v3, §3](https://arxiv.org/html/2410.12557v3#S3),
+  [official target code pinned](https://github.com/kvfrans/shortcut-models/blob/601004348667094e1b71f30942199759412d4432/targets_shortcut.py).
+  Binary composition/duration/self-bootstrap background; slow F bridge/LoRA fade
+  là thiết kế mới, không paper reproduction.
+- [SD3.5 Medium official model card](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium),
+  Diffusers0.33.1 [transformer](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/transformers/transformer_sd3.py),
+  [attention](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/attention.py),
+  [pipeline](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3.py),
+  [scheduler](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py),
+  [checkpointing](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/modeling_utils.py).
+- PyTorch2.6 [FSDP API source](https://github.com/pytorch/pytorch/blob/v2.6.0/torch/distributed/fsdp/api.py)
+  và [functional_call source](https://github.com/pytorch/pytorch/blob/v2.6.0/torch/_functorch/functional_call.py):
+  kiểm tra mixed precision/input casting và EMA adapter query contract.
+- Human latest decisions override old handoff: G distills F; F instantaneous,
+  warm-up, slow tracking, small teacher anchor, gradual LoRA fade; native512,
+  reLAION/global64, G5e-6/F2.5e-5/LoRA96/25%full, teacher50, independent new project.
 
-Những entrypoint sau **cần được implement mới** trong `sd35_shortcut.cli`. Sau
-khi viết xong parser, command contract trên máy GPU của bên nhận là:
+Bên nhận report source/config/checkpoint hashes; fresh smoke/resume/export evidence;
+P0/P1 gates; actual batch/VRAM/timing breakdown; kG/kF/λ/freeze event; F tracking;
+init/A/B per-sample metrics+CI; uncurated one-step images; unique/replayed samples;
+GPU-giờ; limitations và paper parity status. Commit scientific changes trước run,
+ghi lineage ID, không báo convergence từ training loss riêng.
 
-```bash
-# Các configs/local*.yaml phải được tạo từ schema ở §3 với local asset paths thật.
-torchrun --standalone --nproc_per_node=4 -m sd35_shortcut.cli prepare-cache \
-  --config configs/local-sd35-common.yaml
-
-torchrun --standalone --nproc_per_node=4 -m sd35_shortcut.cli warmup \
-  --config configs/local-sd35-common.yaml
-
-# Fork lấy cùng complete shared-init manifest; tạo optimizer mới cho cả hai.
-torchrun --standalone --nproc_per_node=4 -m sd35_shortcut.cli train \
-  --config configs/local-sd35-A.yaml --fork-from runs/sd35/shared-init
-
-torchrun --standalone --nproc_per_node=4 -m sd35_shortcut.cli train \
-  --config configs/local-sd35-B.yaml --fork-from runs/sd35/shared-init
-
-python -m sd35_shortcut.cli compare \
-  --run-a runs/sd35/A --run-b runs/sd35/B --metric-plugin recipient_metrics
-```
-
-`compare` phải đọc finalized generation/evaluator reports, không tự generate scores
-hoặc coi thiếu plugin là0. `prepare-cache` multi-rank chia ids, rank0 finalize sau
-barrier/hash/count checks; chỉ skip existing cache khi manifest matches, không
-overwrite teacher artifacts có scientific settings khác. `warmup` chỉ chốt
-shared-init khi cả hai gates đạt hoặc có exception reason rõ trong metadata.
-`train` chỉ cho diff A/B whitelist; fail fast nếu config khác LR/batch/seed/EMA.
-
-Không import/copy launcher/trainer/config/utility cũ; không override unknown fields
-để bỏ qua schema. Dùng venv/package/run directories riêng, log commit của repo mới.
-Không reset tiến trình bên nhận đang chạy chỉ vì clone/pull bản handoff này.
-
-## 14. Checks bắt buộc trên máy bên nhận và gói trả về
-
-Các checks có giá trị phương pháp: analytical constant/linear field xác nhận dấu
-`x-d*v` và binary composition; duration branch contributes0 ởd=0 kể cả sau training;
-smallest-duration base case; native512 shapes/dual layers; G one-step vs multistep NFE; gradient ownership/detach;
-F frozen-base hash bất biến, chỉ adapter/duration đổi; EMA masters FP32 và update
-đúng actor; accumulation batch64; all-rank skip không deadlock; FSDP G EMA shard
-layout đúng; strict resume/export/reload; A/B config diff chỉ source; metric id/seed
-pairing và prompt disjointness. Pure toy tests không thay H100 smoke thực tế.
-
-Kiểm tra G sampler fractions full/local/short, full interval luôn(sigma=1,d=1),
-full G teacher label luônnoise–teacher_clean, và gradient từ DMD đi qua one-step
-G graph. `sample_shortcuts(steps=1)` phải bằng `one_step` và gọi model1 lần;
-2/4/8 gọi đúngN lần cùng wrapper và d=1/N. Few-step pass không bỏ qua one-step gate.
-
-Smoke4GPU2–4 cycles có AdamW states allocated, checkpoint/resume cycle thật, d=1,
-beta>0 và cảEMA targets, rồi mới P0/P1/P2 thật. Kiểm tra generated noise seed,
-teacher labels, sigmas và decoded images đúng SD3.5 scale. F LoRA có nonzero B
-gradients/update sau first step; A có thể grad0 ngay initial zero-B, không coi đó
-là lỗi. Không checkpoint reentrant làm mất cả B gradients rồi report LoRA “đã train”.
-
-Gói trả về: commit/config hashes, model/cache/frozen-F-base hashes, gates before/after,
-resolved batch64, successful/skipped counts, G/F/duration master deltas, profile
-timings/VRAM/GPU-hours bao gồm setup, shared-init và latest A/B checkpoints, G
-selected export+loader metadata, uncurated same-noise samples, metric provenance,
-per-prompt scores/paired CI, seed replication nếu có. Không claim paper win hoặc
-convergence khi chỉ có losses/logs.
-
-## 15. Sources và trạng thái bàn giao
-
-- FD-loss: [paper v1, B.4/Table B.3](https://arxiv.org/html/2604.28190v1#A2.SS4);
-  [official repository](https://github.com/Jiawei-Yang/FD-Loss/tree/5c03b8112fec8b9432631e4ce053c0d918cc24bc),
-  HEAD đọc ngày2026-10-09. Setting được đọc từ paper, không suy từ ImageNet scripts.
-- Shortcut Models: [paper v3, §3](https://arxiv.org/html/2410.12557v3#S3),
-  [official code pinned](https://github.com/kvfrans/shortcut-models/blob/601004348667094e1b71f30942199759412d4432/targets_shortcut.py).
-- SD3.5: [official model card](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium);
-  Diffusers [transformer](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/transformers/transformer_sd3.py),
-  [pipeline](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3.py)
-  và [checkpointing implementation](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/modeling_utils.py).
-- Yêu cầu chủ project: repo mới độc lập, native512, reLAION local, SD3.5 Medium base
-  Diffusers, one-step, cảG/F shortcut, F LoRA96 + warm-up trước bridge,
-  G5e-6/F2.5e-5, batch64, log chi tiết + TensorBoard, retention ít.
-
-**Đã làm ở phiên authoring:** đọc primary sources, viết thiết kế/code reference,
-static Ruff/AST và kiểm tra YAML/số học config. **Chưa làm:** import Torch, unit
-tests, H100 smoke, FSDP/DDP runtime, numerical parity, save/resume thật, training,
-metric execution hoặc benchmark. Runtime integration còn do bên nhận thực hiện;
-không dùng trạng thái static-only này để báo “coding/training thành công”.
+**Authoring status:** đọc primary sources, viết original code/document; Ruff/AST/
+YAML arithmetic và consistency checks tĩnh. **Chưa chạy:** Torch imports, unit/toy/
+GPU tests, numerical parity, distributed runtime, training, save/resume thật,
+metrics hoặc benchmark. Runtime integration và GPU verification còn bên nhận làm.

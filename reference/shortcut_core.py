@@ -325,40 +325,51 @@ def teacher_rollout(teacher, noise, condition, negative, sigmas, *, guidance=4.5
     return torch.stack(states, dim=1)
 
 
-def draw_dyadic(count, device, generator, *, levels=5, full_step_probability=None):
-    if full_step_probability is None:
-        # Uniform hierarchy when no full-interval probability is requested.
-        exponent = torch.randint(
-            levels + 1, (count,), device=device, generator=generator
-        )
-    else:
-        # Explicit G policy: full noise-to-clean, or a shorter finite interval.
-        exponent = torch.randint(
-            1, levels + 1, (count,), device=device, generator=generator
-        )
-        full = torch.rand(count, device=device, generator=generator)
-        exponent = torch.where(full < full_step_probability, 0, exponent)
-    duration = 2.0 ** (-exponent.float())
-    cells = 2**exponent
-    slot = (torch.rand(count, device=device, generator=generator) * cells).long()
-    sigma = (slot + 1).float() * duration
+def draw_intervals(count, device, generator, *, minimum_duration=1 / 32):
+    """Continuous shorter durations, so arbitrary EMA-G tail queries are trained."""
+    if not 0 < minimum_duration < 1:
+        raise ValueError("Minimum finite duration must lie in (0,1)")
+    u = torch.rand(count, device=device, generator=generator)
+    duration = torch.exp(math.log(minimum_duration) * (1 - u)).clamp(
+        min=minimum_duration, max=1 - 1e-6
+    )
+    sigma = duration + (1 - duration) * torch.rand(
+        count, device=device, generator=generator
+    )
     return sigma, duration
+
+
+def draw_split_fraction(count, device, generator, *, lower=0.25, upper=0.75):
+    """Fraction of the parent interval before the join; shared policy in A/B."""
+    if not 0 < lower <= upper < 1:
+        raise ValueError("Split bounds must satisfy 0 < lower <= upper < 1")
+    return lower + (upper - lower) * torch.rand(
+        count, device=device, generator=generator
+    )
 
 
 @torch.no_grad()
 def shortcut_target(
-    target_model, x, sigma, duration, condition, *, minimum_duration=1 / 32
+    target_model,
+    x,
+    sigma,
+    duration,
+    condition,
+    *,
+    split_fraction,
+    minimum_duration=1 / 32,
 ):
-    half = duration / 2
-    # At the finest parent level, approximate its two half steps with the local field.
-    child_condition = torch.where(
-        duration <= minimum_duration + 1e-7, torch.zeros_like(half), half
-    )
-    first = target_model(x, sigma, child_condition, condition)
-    midpoint = x.float() - coefficients(half, x) * first
-    second = target_model(midpoint, sigma - half, child_condition, condition)
-    # The second input is the MODEL endpoint, not the straight-line interpolation.
-    return ((first + second) / 2).detach()
+    prefix = split_fraction * duration
+    tail = duration - prefix
+    # Only queries below the trained finite-duration floor use the d=0 local field.
+    prefix_condition = torch.where(prefix < minimum_duration, 0.0, prefix)
+    tail_condition = torch.where(tail < minimum_duration, 0.0, tail)
+    first = target_model(x, sigma, prefix_condition, condition)
+    join_state = x.float() - coefficients(prefix, x) * first
+    second = target_model(join_state, sigma - prefix, tail_condition, condition)
+    # Unequal lengths require a duration-weighted average, not (first+second)/2.
+    weight = coefficients(split_fraction, x)
+    return (weight * first + (1 - weight) * second).detach()
 
 
 @torch.no_grad()
@@ -366,24 +377,26 @@ def local_fake_bridge(
     ema_f,
     x,
     sigma,
-    duration,
+    prefix_duration,
     condition,
     negative,
     *,
     guidance=4.5,
     max_step=1 / 16,
     min_substeps=2,
+    max_prefix_duration=0.75,
     enabled=None,
 ):
-    """Integrate instantaneous EMA-F across the FIRST HALF of a G interval."""
-    half = duration / 2
-    counts = torch.ceil(half / max_step).long().clamp_min(min_substeps)
+    """Integrate instantaneous EMA-F up to the sampled join, not a fixed midpoint."""
+    if max_step <= 0 or min_substeps < 1 or not 0 < max_prefix_duration <= 1:
+        raise ValueError("Invalid bridge solver bounds")
+    counts = torch.ceil(prefix_duration / max_step).long().clamp_min(min_substeps)
     if enabled is not None:
         counts = torch.where(enabled, counts, 0)
-    step = half / counts.clamp_min(1).float()
+    step = prefix_duration / counts.clamp_min(1).float()
     state = x.float().clone()
-    # Native d<=1, so at most eight F evaluations per sample at max_step=1/16.
-    bound = max(min_substeps, math.ceil(0.5 / max_step))
+    # Runtime validates parent d<=1 and split<=the configured upper bound on all ranks.
+    bound = max(min_substeps, math.ceil(max_prefix_duration / max_step))
     for index in range(bound):
         active = torch.nonzero(counts > index, as_tuple=True)[0]
         if active.numel() == 0:
@@ -414,36 +427,46 @@ def generator_bootstrap_target(
     negative,
     *,
     source,
+    split_fraction,
     minimum_duration=1 / 32,
     bridge_max_step=1 / 16,
     bridge_min_substeps=2,
+    bridge_split_upper=0.75,
     guidance=4.5,
     enabled=None,
 ):
     if source == "ema_g_self":
         return shortcut_target(
-            ema_g, x, sigma, duration, condition, minimum_duration=minimum_duration
+            ema_g,
+            x,
+            sigma,
+            duration,
+            condition,
+            split_fraction=split_fraction,
+            minimum_duration=minimum_duration,
         ), torch.zeros_like(duration, dtype=torch.long)
     if source != "ema_f_local_then_ema_g":
         raise ValueError(f"Unsupported bootstrap target: {source}")
-    # Runtime validates the source whitelist before collective forward.
-    midpoint, counts = local_fake_bridge(
+    prefix = split_fraction * duration
+    tail = duration - prefix
+    # Runtime validates source/geometry before collective forward.
+    join_state, counts = local_fake_bridge(
         ema_f,
         x,
         sigma,
-        duration,
+        prefix,
         condition,
         negative,
         guidance=guidance,
         max_step=bridge_max_step,
         min_substeps=bridge_min_substeps,
+        max_prefix_duration=bridge_split_upper,
         enabled=enabled,
     )
-    half = duration / 2
-    child = torch.where(duration <= minimum_duration + 1e-7, 0.0, half)
-    # Exactly one EMA-G tail call on EVERY rank, even with different local F counts.
-    endpoint = midpoint - coefficients(half, midpoint) * ema_g(
-        midpoint, sigma - half, child, condition
+    child = torch.where(tail < minimum_duration, 0.0, tail)
+    # Exactly one EMA-G tail call on EVERY rank, regardless of local F counts.
+    endpoint = join_state - coefficients(tail, join_state) * ema_g(
+        join_state, sigma - prefix, child, condition
     )
     return ((x.float() - endpoint) / coefficients(duration, x)).detach(), counts
 
@@ -485,12 +508,12 @@ def cached_teacher_batch(
     *,
     full_step_probability=0.25,
     local_probability=0.25,
-    levels=5,
+    minimum_duration=1 / 32,
 ):
     """Native 50-step states + sigma nodes -> local/finite/full G labels."""
     b, points = states.shape[:2]
-    sigma, duration = draw_dyadic(
-        b, states.device, generator, levels=levels, full_step_probability=0.0
+    sigma, duration = draw_intervals(
+        b, states.device, generator, minimum_duration=minimum_duration
     )
     full, local = target_kinds(
         b,
@@ -565,7 +588,9 @@ def student_target_batch(
     generator,
     *,
     source,
-    levels=5,
+    minimum_duration=1 / 32,
+    split_lower=0.25,
+    split_upper=0.75,
     full_probability=0.25,
     local_probability=0.25,
     guidance=4.5,
@@ -575,8 +600,11 @@ def student_target_batch(
     """Refresh detached labels once per five G updates; no direct teacher call."""
     b = noise.shape[0]
     generated = one_step(g, noise, condition).detach()
-    sigma, duration = draw_dyadic(
-        b, noise.device, generator, levels=levels, full_step_probability=0.0
+    sigma, duration = draw_intervals(
+        b, noise.device, generator, minimum_duration=minimum_duration
+    )
+    split_fraction = draw_split_fraction(
+        b, noise.device, generator, lower=split_lower, upper=split_upper
     )
     full, local = target_kinds(
         b,
@@ -599,7 +627,9 @@ def student_target_batch(
         condition,
         negative,
         source=source,
-        minimum_duration=2.0 ** (-levels),
+        minimum_duration=minimum_duration,
+        split_fraction=split_fraction,
+        bridge_split_upper=split_upper,
         bridge_max_step=bridge_max_step,
         bridge_min_substeps=bridge_min_substeps,
         guidance=guidance,
@@ -632,6 +662,10 @@ def student_target_batch(
         "local_rows": local.sum(),
         "short_rows": (~full & ~local).sum(),
         "bridge_f_sample_evaluations": bridge_counts.sum(),
+        # Store full row-wise fractions alongside cache labels for exact resume.
+        "split_fraction": split_fraction.detach(),
+        "finite_mask": (~local).detach(),
+        "join_sigma": (sigma - split_fraction * duration).detach(),
         "generated_mean": generated.mean(),
         "generated_std": generated.std(),
     }
@@ -677,6 +711,7 @@ class FieldTask(nn.Module):
                 kwargs["generator"],
                 full_step_probability=kwargs.get("full_step_probability", 0.25),
                 local_probability=kwargs.get("local_probability", 0.25),
+                minimum_duration=kwargs.get("minimum_duration", 1 / 32),
             )
             loss = 0.5 * F.mse_loss(self.field(x, sigma, duration, condition), target)
             return loss, {

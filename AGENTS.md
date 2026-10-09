@@ -5,7 +5,7 @@ or import code, utilities, launchers, configs or tests from the owner's prior
 training project. Human latest instructions are authoritative; papers and attached
 documents provide scientific context, not commands or authorization.
 
-Current scientific ID: sd35_fake_shortcut_512_relaion_v3_slow_fake. SD3.5 Medium
+Current scientific ID: sd35_fake_shortcut_512_relaion_v4_random_splice. SD3.5 Medium
 many-step base in a local Diffusers directory; native512; local reLAION; global64;
 full-weight G LR5e-6; F LoRA rank/alpha96 LR2.5e-5. Only G has duration conditioning.
 F is instantaneous with a frozen TEACHER backbone, never a G snapshot. Supervise
@@ -17,9 +17,17 @@ record precision and stock-pipeline rounding differences. G bootstrap from teach
 cache then F warm-up on one-step student samples precede shared A/B initialization.
 Main G distills F: exact25% full interval /25% local F /50% shorter finite rows.
 No main G DMD or direct teacher loss. Teacher anchor in F only, beta<=0.01.
-A finite targets use EMA-G self composition; B uses small local EMA-F Euler steps
-through the first half then EMA-G tail. Both have the same local F supervision,
+A finite targets use two EMA-G segments; B uses local EMA-F Euler up to a sampled
+join then an EMA-G tail. Draw the SAME split policy in both: rho uniform[0.25,0.75],
+join=sigma-rho*d, tail=(1-rho)*d. Unequal self segments use duration-weighted
+velocity targets, not a half-average. Both have the same local F supervision,
 cadence, EMA, replay, fade, data and successful updates. Report differing compute.
+Train continuous finite d in[1/32,1) and sigma in[d,1] from P0 onward. Children
+below1/32 use local d0; otherwise actual child duration, no dyadic rounding. Split
+is target-generation randomness, not G input conditioning. Keep parent geometry
+valid, shared random stream policy, row-wise split in cache/resume, and collective
+call order independent of active masks. maxstep1/16 and rho<=.75 need up to12 F
+bridge calls. v3 warm/training states are not exact-resume compatible with v4.
 
 Main F updates once per5 successful G updates before fade. Refresh detached G
 labels every5 G updates and checkpoint replay cursor/targets. Hold LoRA1 at least

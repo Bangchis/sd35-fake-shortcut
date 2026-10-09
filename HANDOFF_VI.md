@@ -1,6 +1,6 @@
 # SD3.5 Medium: student distill slow fake, shortcut và LoRA fade
 
-Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v3_slow_fake`.
+Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v4_random_splice`.
 
 **Một project mới độc lập**, native **512×512**, checkpoint SD3.5 Medium **base nhiều
 bước** dạng Diffusers local, captions **reLAION đã có**, global batch **64**.
@@ -24,15 +24,16 @@ conditioning độ dài shortcut; F không học shortcut và không có duratio
   F qua target anchor nhỏ β≤0.01; teacher dùng riêng ở P0/cache/evaluation.
 - F warm-up trên ảnh one-step của G trước. Sau đó F update **1 lần / 5 G updates**;
   EMA-F làm target. Đó là cadence chậm, chưa đảm bảo field drift nhỏ: phải đo.
-- Target G refresh mỗi **5 successful G updates**, giữ detached để replay 5 lần.
+- Target G refresh mỗi **5 successful G updates**, draw điểm nối mới tại refresh rồi
+  giữ labels/split detached để replay 5 lần.
   Giảm target-generation cost, không giảm số G forward/backward hoặc giấu staleness.
 
 **Matched A/B**, chỉ đổi cách tạo target finite shortcut:
 
 | Nhánh | Local 25% của G | Finite target 75% của G |
 |---|---|---|
-| A — self control | distill EMA-F velocity | EMA-G đi hai half-shortcuts |
-| B — proposed bridge | distill EMA-F velocity | EMA-F đi các Euler bước nhỏ qua nửa đầu; EMA-G shortcut nửa cuối |
+| A — self control | distill EMA-F velocity | EMA-G đi hai đoạn, dùng cùng điểm nối ngẫu nhiên |
+| B — proposed bridge | distill EMA-F velocity | EMA-F Euler tới điểm nối ngẫu nhiên; EMA-G shortcut tới cuối đoạn |
 
 75% finite gồm **25% full d=1 + 50% shorter intervals**; toàn batch còn **25% d=0**.
 Default microbatch chia hết cho4 ⇒ global 64 có **16 full / 16 local / 32 short**,
@@ -61,9 +62,12 @@ nhờ tracking/shortcut loss giảm.** Nguồn hướng về teacher là anchor 
 là LoRA fade; phải đo one-step quality khi fade diễn ra. Trước fade, A/B chỉ kiểm
 tra lợi ích finite target route, chưa chứng minh chất lượng vượt teacher/baseline.
 
-Revision này thay v2/v3 draft cũ: bỏ F-shortcut, F backbone copy từ G, DMD và
-teacher loss trực tiếp trong main; full target25%; teacher cache50; slow F và
-fade có freeze. **Không resume state của thuật toán cũ** vào revision này.
+Revision v4: điểm nối ngẫu nhiên thay fixed-half của v3, cả A/B dùng cùng split
+policy; parent durations và start sigma liên tục, P0 cũng train continuous durations.
+Giữ các quyết định slow F/fade/full25%/teacher50 của v3. Không exact-resume training
+state v3 vào v4: bootstrap G lại để tránh query durations chưa được train. Teacher50
+và text caches có thể reuse nếu geometry/source/precision/hash trùng. Các revision
+trước v3 còn có F-shortcut/DMD/G-copy backbone, không đưa lại vào setting này.
 
 ## 2. Đã đọc setting FD-loss, nhưng không bê nguyên sang đây
 
@@ -103,7 +107,7 @@ Schema dưới đây cần runtime mới triển khai. Đường dẫn là place
 trên máy bên nhận. Batch/GPU và bộ nhớ cần profile H100, chưa có số đo ở Mac.
 
 ```yaml
-scientific_id: sd35_fake_shortcut_512_relaion_v3_slow_fake
+scientific_id: sd35_fake_shortcut_512_relaion_v4_random_splice
 backbone_path: /ABS/PATH/TO/SD35_MEDIUM_DIFFUSERS
 backbone_kind: sd35_medium_base
 local_files_only: true
@@ -132,6 +136,12 @@ primary_evaluation_steps: 1
 diagnostic_inference_steps: [2, 4, 8]
 diagnostic_prompt_count: 16
 minimum_shortcut_duration: 0.03125
+short_interval_sampling: continuous_log_uniform  # d in [1/32,1), full d1 riêng
+start_sigma_sampling: uniform_given_duration  # sigma in [d,1]
+bootstrap_split_sampling: uniform_fraction_of_parent
+bootstrap_split_fraction_min: 0.25
+bootstrap_split_fraction_max: 0.75
+g_condition_on_split: false
 
 generator_train_mode: full_weight
 fake_train_mode: lora
@@ -244,18 +254,51 @@ Duration khác timestep: mọi lời gọi G đều có sigma và d, không cộ
 MLP chạy trước block checkpointing; yêu cầu non-reentrant checkpointing theo
 pinned Diffusers, kiểm tra gradient của nhánh này khi recipient smoke.
 
-A finite target: gọi EMA-G trên hai nửa độ dài `d/2`, lần2 ở **model midpoint**,
-lấy trung bình velocities. Với parent d=1/32, child sử dụng d=0 làm local boundary.
-B finite target: tích phân **guided EMA-F instantaneous** qua `d/2` bằng Euler,
-mỗi bước≤1/16 và ít nhất2 substeps; EMA-G dự đoán nửa còn lại từ midpoint đó.
-Full d=1 cần8 F velocity evaluations +1 EMA-G tail; interval ngắn cần2..4 F calls.
-Internal CFG gộp2B vào một field forward: báo cả denoising evaluations và
-conditional branches, không gọi nó là một conditional NFE. Target detached.
+Điểm nối không cố định tại giữa đoạn. Với parent từ sigma tới sigma-d, lấy
+`rho ~ Uniform(0.25,0.75)` rồi:
 
-G local25% distill trực tiếp guided EMA-F ở re-noised one-step G states; full25%
-học endpoint từ noise; short50% học các d∈{1/2,1/4,1/8,1/16,1/32}. Cả A/B dùng
-cùng loss `0.5*mean((G-target)^2)` trên64 rows, không còn auxiliary1/4 khác batch.
-Chỉ G có finite duration head; F không bootstrap tự học và không nhận finite d.
+```text
+prefix = rho * d
+sigma_join = sigma - prefix
+tail = (1-rho) * d
+sigma_end = sigma - d
+B: x_sigma -- EMA-F Euler prefix --> x_join -- EMA-G(tail) --> x_end
+A: x_sigma -- EMA-G(prefix) ------> x_join -- EMA-G(tail) --> x_end
+G target = (x_sigma - x_end) / d
+```
+
+Tức `sigma_join` nằm trong `[sigma-0.75*d, sigma-0.25*d]`, luôn bên trong parent.
+Không lấy timestep độc lập trên[0,1] rồi đi vượt end/start. G input vẫn
+`(x_sigma, sigma, d, condition)`; **rho/sigma_join chỉ xây target, không thêm
+condition split vào G**. G học đi trọn đoạn dù target route được nối ở
+các điểm khác nhau. F nhận từng physical sigma trong prefix; không duration head.
+
+A lấy velocity trung bình có trọng số `rho*v_first + (1-rho)*v_tail`, không
+`(v_first+v_tail)/2` khi hai đoạn không bằng nhau. B tích phân local guided EMA-F
+qua prefix, rồi gọi EMA-G đúng **tail duration** tại **model-generated join state**;
+không dùng điểm nối trên straight-line interpolation thay cho model endpoint.
+Target cuối là displacement/duration và detached trong cả A/B.
+
+Vì tail có độ dài tùy ý, G phải học continuous durations ngay P0: shorter d được
+lấy log-uniform trên `[1/32,1)`; start sigma uniform trên `[d,1]`. Full25% vẫn
+đúng `(sigma,d)=(1,1)` và local25% vẫn d0. Không chỉ train trên1/2,1/4,... rồi
+query G ở0.3/0.7 mà coi như đã verify. Child prefix/tail **nhỏ hơn1/32** dùng G(d0)
+như local boundary approximation; nếu >=1/32 thì truyền actual child duration,
+không làm tròn về dyadic levels. Không gọi approximation nhỏ đó là exact integration.
+
+B Euler maxstep1/16, min2 substeps: với rho≤.75,d≤1, tối đa12 F evaluations/row;
+full d1 cần4..12 calls. CFG gộp2B trong mỗi active call; đếm branches thật. Expected
+prefix bằng nửa đoạn theo uniform symmetric rho, nhưng ceil/min2 và batching khiến
+walltime không nhất thiết bằng fixed-half. Report rho distribution, join sigma,
+child lengths/local-boundary fractions và F costs theo loại target.
+
+G loss mixed64 vẫn `0.5*mean((G-target)^2)`:16full/16local/32continuous-short.
+Local25% trực tiếp distill guided EMA-F ở re-noised G states. One-step inference
+không cần chọn rho, F rollout hay EMA-G tail: **G gọi một lần từ sigma1,d1**.
+**Random shorter segments là supervision để xây năng lực one-step.** Chọn/evaluate
+checkpoint và kết luận quality luôn bằng one-step; không chọn model chỉ vì2/4/8-step
+đẹp hoặc finite loss giảm. Giữ25%full theo quyết định trước, không thay bằng chỉ
+sampling continuous vì xác suất rút đúng d1 khi đó bằng0.
 
 F target: generate `y_G` với current online G, detach; lấy z' độc lập noise đã tạo
 ảnh, `x=(1-sigma)*y_G+sigma*z'`. MSE supervised field là
@@ -306,7 +349,7 @@ chưa gồm text/metadata; không giữ toàn bộ cache GPU. BF16 subtraction h
 cạnh nhau có thể phá small-d labels, không tiết kiệm bằng cách hạ states BF16.
 Cache manifest lưu model/config/scheduler/sigma/noise/prompt hashes, code commit.
 
-Full target d1 lấy exact cache noise→endpoint. Finite dyadic target nội suy
+Full target d1 lấy exact cache noise→endpoint. Finite continuous target nội suy
 piecewise-linear **actual physical sigma** giữa native states rồi lấy average
 velocity; đó là label từ cached Euler interpolant, không gọi exact continuous
 teacher flow. Local d0 label lấy slope actual native edge ở cached vertex. Không
@@ -337,7 +380,8 @@ reset EMA-F to validated online F, G P2 optimizer mới nhưng F optimizer giữ
 1. Boundary k_G=0,5,10,... trước fade: 1 F update successful theo fresh detached
    current G samples, β ramp; update EMA-F. F targets không cache/replay5 lần.
 2. Set λ theo event schedule. Tạo global 64 G targets từ current G + EMA-G/EMA-F,
-   detached, fixed prompt/noise IDs. A/B nguồn finite khác nhau, local giống nhau.
+   detached, fixed prompt/noise IDs và row-wise rho/sigma_join. A/B nguồn prefix
+   khác nhau, local và split sampling giống nhau; draw rho trước source branch.
 3. G train5 successful updates trên **chính64 cached target rows**; mỗi update
    loss64 và accumulation đúng. EMA-G update sau mỗi G optimizer success.
 4. Boundary k_G=200: **trước** F update mới, audit fade gate. Nếu fail, save/stop
@@ -709,40 +753,51 @@ def teacher_rollout(teacher, noise, condition, negative, sigmas, *, guidance=4.5
     return torch.stack(states, dim=1)
 
 
-def draw_dyadic(count, device, generator, *, levels=5, full_step_probability=None):
-    if full_step_probability is None:
-        # Uniform hierarchy when no full-interval probability is requested.
-        exponent = torch.randint(
-            levels + 1, (count,), device=device, generator=generator
-        )
-    else:
-        # Explicit G policy: full noise-to-clean, or a shorter finite interval.
-        exponent = torch.randint(
-            1, levels + 1, (count,), device=device, generator=generator
-        )
-        full = torch.rand(count, device=device, generator=generator)
-        exponent = torch.where(full < full_step_probability, 0, exponent)
-    duration = 2.0 ** (-exponent.float())
-    cells = 2**exponent
-    slot = (torch.rand(count, device=device, generator=generator) * cells).long()
-    sigma = (slot + 1).float() * duration
+def draw_intervals(count, device, generator, *, minimum_duration=1 / 32):
+    """Continuous shorter durations, so arbitrary EMA-G tail queries are trained."""
+    if not 0 < minimum_duration < 1:
+        raise ValueError("Minimum finite duration must lie in (0,1)")
+    u = torch.rand(count, device=device, generator=generator)
+    duration = torch.exp(math.log(minimum_duration) * (1 - u)).clamp(
+        min=minimum_duration, max=1 - 1e-6
+    )
+    sigma = duration + (1 - duration) * torch.rand(
+        count, device=device, generator=generator
+    )
     return sigma, duration
+
+
+def draw_split_fraction(count, device, generator, *, lower=0.25, upper=0.75):
+    """Fraction of the parent interval before the join; shared policy in A/B."""
+    if not 0 < lower <= upper < 1:
+        raise ValueError("Split bounds must satisfy 0 < lower <= upper < 1")
+    return lower + (upper - lower) * torch.rand(
+        count, device=device, generator=generator
+    )
 
 
 @torch.no_grad()
 def shortcut_target(
-    target_model, x, sigma, duration, condition, *, minimum_duration=1 / 32
+    target_model,
+    x,
+    sigma,
+    duration,
+    condition,
+    *,
+    split_fraction,
+    minimum_duration=1 / 32,
 ):
-    half = duration / 2
-    # At the finest parent level, approximate its two half steps with the local field.
-    child_condition = torch.where(
-        duration <= minimum_duration + 1e-7, torch.zeros_like(half), half
-    )
-    first = target_model(x, sigma, child_condition, condition)
-    midpoint = x.float() - coefficients(half, x) * first
-    second = target_model(midpoint, sigma - half, child_condition, condition)
-    # The second input is the MODEL endpoint, not the straight-line interpolation.
-    return ((first + second) / 2).detach()
+    prefix = split_fraction * duration
+    tail = duration - prefix
+    # Only queries below the trained finite-duration floor use the d=0 local field.
+    prefix_condition = torch.where(prefix < minimum_duration, 0.0, prefix)
+    tail_condition = torch.where(tail < minimum_duration, 0.0, tail)
+    first = target_model(x, sigma, prefix_condition, condition)
+    join_state = x.float() - coefficients(prefix, x) * first
+    second = target_model(join_state, sigma - prefix, tail_condition, condition)
+    # Unequal lengths require a duration-weighted average, not (first+second)/2.
+    weight = coefficients(split_fraction, x)
+    return (weight * first + (1 - weight) * second).detach()
 
 
 @torch.no_grad()
@@ -750,24 +805,26 @@ def local_fake_bridge(
     ema_f,
     x,
     sigma,
-    duration,
+    prefix_duration,
     condition,
     negative,
     *,
     guidance=4.5,
     max_step=1 / 16,
     min_substeps=2,
+    max_prefix_duration=0.75,
     enabled=None,
 ):
-    """Integrate instantaneous EMA-F across the FIRST HALF of a G interval."""
-    half = duration / 2
-    counts = torch.ceil(half / max_step).long().clamp_min(min_substeps)
+    """Integrate instantaneous EMA-F up to the sampled join, not a fixed midpoint."""
+    if max_step <= 0 or min_substeps < 1 or not 0 < max_prefix_duration <= 1:
+        raise ValueError("Invalid bridge solver bounds")
+    counts = torch.ceil(prefix_duration / max_step).long().clamp_min(min_substeps)
     if enabled is not None:
         counts = torch.where(enabled, counts, 0)
-    step = half / counts.clamp_min(1).float()
+    step = prefix_duration / counts.clamp_min(1).float()
     state = x.float().clone()
-    # Native d<=1, so at most eight F evaluations per sample at max_step=1/16.
-    bound = max(min_substeps, math.ceil(0.5 / max_step))
+    # Runtime validates parent d<=1 and split<=the configured upper bound on all ranks.
+    bound = max(min_substeps, math.ceil(max_prefix_duration / max_step))
     for index in range(bound):
         active = torch.nonzero(counts > index, as_tuple=True)[0]
         if active.numel() == 0:
@@ -798,36 +855,46 @@ def generator_bootstrap_target(
     negative,
     *,
     source,
+    split_fraction,
     minimum_duration=1 / 32,
     bridge_max_step=1 / 16,
     bridge_min_substeps=2,
+    bridge_split_upper=0.75,
     guidance=4.5,
     enabled=None,
 ):
     if source == "ema_g_self":
         return shortcut_target(
-            ema_g, x, sigma, duration, condition, minimum_duration=minimum_duration
+            ema_g,
+            x,
+            sigma,
+            duration,
+            condition,
+            split_fraction=split_fraction,
+            minimum_duration=minimum_duration,
         ), torch.zeros_like(duration, dtype=torch.long)
     if source != "ema_f_local_then_ema_g":
         raise ValueError(f"Unsupported bootstrap target: {source}")
-    # Runtime validates the source whitelist before collective forward.
-    midpoint, counts = local_fake_bridge(
+    prefix = split_fraction * duration
+    tail = duration - prefix
+    # Runtime validates source/geometry before collective forward.
+    join_state, counts = local_fake_bridge(
         ema_f,
         x,
         sigma,
-        duration,
+        prefix,
         condition,
         negative,
         guidance=guidance,
         max_step=bridge_max_step,
         min_substeps=bridge_min_substeps,
+        max_prefix_duration=bridge_split_upper,
         enabled=enabled,
     )
-    half = duration / 2
-    child = torch.where(duration <= minimum_duration + 1e-7, 0.0, half)
-    # Exactly one EMA-G tail call on EVERY rank, even with different local F counts.
-    endpoint = midpoint - coefficients(half, midpoint) * ema_g(
-        midpoint, sigma - half, child, condition
+    child = torch.where(tail < minimum_duration, 0.0, tail)
+    # Exactly one EMA-G tail call on EVERY rank, regardless of local F counts.
+    endpoint = join_state - coefficients(tail, join_state) * ema_g(
+        join_state, sigma - prefix, child, condition
     )
     return ((x.float() - endpoint) / coefficients(duration, x)).detach(), counts
 
@@ -869,12 +936,12 @@ def cached_teacher_batch(
     *,
     full_step_probability=0.25,
     local_probability=0.25,
-    levels=5,
+    minimum_duration=1 / 32,
 ):
     """Native 50-step states + sigma nodes -> local/finite/full G labels."""
     b, points = states.shape[:2]
-    sigma, duration = draw_dyadic(
-        b, states.device, generator, levels=levels, full_step_probability=0.0
+    sigma, duration = draw_intervals(
+        b, states.device, generator, minimum_duration=minimum_duration
     )
     full, local = target_kinds(
         b,
@@ -949,7 +1016,9 @@ def student_target_batch(
     generator,
     *,
     source,
-    levels=5,
+    minimum_duration=1 / 32,
+    split_lower=0.25,
+    split_upper=0.75,
     full_probability=0.25,
     local_probability=0.25,
     guidance=4.5,
@@ -959,8 +1028,11 @@ def student_target_batch(
     """Refresh detached labels once per five G updates; no direct teacher call."""
     b = noise.shape[0]
     generated = one_step(g, noise, condition).detach()
-    sigma, duration = draw_dyadic(
-        b, noise.device, generator, levels=levels, full_step_probability=0.0
+    sigma, duration = draw_intervals(
+        b, noise.device, generator, minimum_duration=minimum_duration
+    )
+    split_fraction = draw_split_fraction(
+        b, noise.device, generator, lower=split_lower, upper=split_upper
     )
     full, local = target_kinds(
         b,
@@ -983,7 +1055,9 @@ def student_target_batch(
         condition,
         negative,
         source=source,
-        minimum_duration=2.0 ** (-levels),
+        minimum_duration=minimum_duration,
+        split_fraction=split_fraction,
+        bridge_split_upper=split_upper,
         bridge_max_step=bridge_max_step,
         bridge_min_substeps=bridge_min_substeps,
         guidance=guidance,
@@ -1016,6 +1090,10 @@ def student_target_batch(
         "local_rows": local.sum(),
         "short_rows": (~full & ~local).sum(),
         "bridge_f_sample_evaluations": bridge_counts.sum(),
+        # Store full row-wise fractions alongside cache labels for exact resume.
+        "split_fraction": split_fraction.detach(),
+        "finite_mask": (~local).detach(),
+        "join_sigma": (sigma - split_fraction * duration).detach(),
         "generated_mean": generated.mean(),
         "generated_std": generated.std(),
     }
@@ -1061,6 +1139,7 @@ class FieldTask(nn.Module):
                 kwargs["generator"],
                 full_step_probability=kwargs.get("full_step_probability", 0.25),
                 local_probability=kwargs.get("local_probability", 0.25),
+                minimum_duration=kwargs.get("minimum_duration", 1 / 32),
             )
             loss = 0.5 * F.mse_loss(self.field(x, sigma, duration, condition), target)
             return loss, {
@@ -1188,7 +1267,7 @@ backward F; λ=0 bỏ adapter branch. Set λ cho model trước cả online/EMA-
 ## 9. Update transaction và distributed correctness
 
 Trước phase/fork, broadcast resolved config/hash/decision. Mọi rank kiểm tra cùng
-world size, batch64, microbatch chia hết4, source whitelist, cache geometry/sigmas,
+world size, batch64, microbatch chia hết4, source whitelist, cache geometry/sigmas, split bounds/child durations,
 parameter ownership và prompt cursors. Exception trên rank0 phải thông báo/abort
 đồng bộ; không để ranks khác chờ collective.
 
@@ -1196,7 +1275,7 @@ Mỗi refresh dựng global64 targets bằng `student_target_batch` theo từng 
 Builder chạy no_grad; online G và EMA-G FSDP calls **ngoài differentiable G loss**.
 Teacher không truyền vào builder/loss. Cache x/sigma/d/label FP32 detached,
 condition references, prompt IDs/noise hashes, generation k_G, λ, EMA revisions,
-source, RNG và replay cursor. Cache64×2 latents chỉ~32MiB; text có thể stream CPU.
+source, row-wise rho/join sigma, RNG và replay cursor. Cache64×2 latents chỉ~32MiB; text có thể stream CPU.
 Replay cùng row order5 updates; A/B dùng riêng namespace nhưng matched prompt/
 noise RNG streams. Không reuse target tensors giữa arms vì states khác nhau.
 
@@ -1204,7 +1283,7 @@ A cần2 EMA-G calls; B cần1 EMA-G tail và rank-local F loops. **Mọi rank g
 số FSDP collective forwards**, kể cả dummy finite inputs của local rows trước
 khi overwrite bằng local F labels. Không branch FSDP call theo active IDs hoặc
 số Euler loops khác nhau. F loops chỉ raw F/AdapterEMA, không collectives. Audit
-min2/max8 counts và effective CFG branches; đếm discarded dummy EMA-G work vào
+min2/max12 counts và effective CFG branches; đếm discarded dummy EMA-G work vào
 profiling. Local target là combined F_CFG, không conditional F hay double CFG.
 
 Microbatch gradient gọi outer task:
@@ -1251,6 +1330,8 @@ Scalar groups cần có:
 - Latent mean/std/range/nonfinite; skips/reasons; actual64/16full/16local/32short.
 - New target rows và replay row presentations; target age; F cadence;
   actual λ target strength; beta và teacher coefficient/RMS/mixing delta.
+- Finite-row rho histogram/min/max/mean, join sigma, prefix/tail duration và tỷ lệ
+  child dùng d0 boundary; log các giá trị row-wise trong target cache, không chỉ mean.
 - Call counts T/F/G/EMA theo target generation/backward/probe; denoising
   evaluations và conditional branches. Teacher50 là50 CFG calls/100 branches;
   standalone G export là1 conditional transformer call.
@@ -1271,10 +1352,10 @@ image score. Fixed8 uncurated images at150/300; 2/4/8-step diagnostics16 val pro
 riêng. Final test không dùng trong training/tuning dashboards. Giữ probe scalars
 và fixed hashes, không dump full activations/gradients hoặc vô số sample images.
 
-Trước fork, kiểm tra F bridge midpoint maxstep1/16 vs1/32 trên16 val states cùng
-λ: normalized RMS difference và finiteness. Nếu difference>0.05×finer-midpoint RMS,
+Trước fork, kiểm tra F bridge join state maxstep1/16 vs1/32 trên16 val states cùng
+λ và cùng row-wise rho: normalized RMS difference và finiteness. Nếu difference>0.05×finer-join RMS,
 flag coarse; refine chung trước fork hoặc stop. Ngưỡng heuristic, không proof
-Euler exact. 2..8 F calls khác teacher50; không gọi bridge là exact teacher path.
+Euler exact. 2..12 F calls khác teacher50; không gọi bridge là exact teacher path.
 
 ## 11. Checkpoint, freeze và minimal retention
 
@@ -1284,7 +1365,7 @@ verify hashes→completion marker→replace; prune chỉ sau save hoàn tất. K
 assets/checkpoint của run khác. Không commit weights/data/logs/images/tokens lên GitHub.
 
 Full resume lưu G/F/EMA-G/EMA-F, cả optimizer states FP32; phase/counters/boundary/
-replay; per-rank CPU/CUDA RNG và prompt cursor; cached labels/references nếu replay
+replay; per-rank CPU/CUDA RNG và prompt cursor; cached labels/split fractions/references nếu replay
 active; β/λ/fade event/gate history/frozen adapter hashes; architecture/duration/
 LoRA targets/versions/world size. F base có thể rehydrate từ local T nếu strict
 hash check, nhưng chỉ LoRA state_dict thiếu λ/freeze event thì chưa đủ resume.
@@ -1386,11 +1467,14 @@ SD3.5 COCO. Thiếu audit thì `paper_protocol_equivalence=unverified`.
 3. F zero-B hoặc λ0 bằng T_CFG4.5; shrink frozen adapters về0 tiến tới T. Combined
    F_CFG backward finite, useful LoRA projections có gradients; F không duration.
    Master/moments/EMA FP32, cached targets không bị FSDP cast BF16.
-4. Constant/linear velocity toy fields verify Euler sign, model midpoint, child
-   local boundary, min/max substeps và B `(x-end)/d`; targets detached, independent
+4. Constant/linear velocity toy fields verify Euler sign, arbitrary join, duration-
+   weighted composition, child local boundary và B `(x-end)/d`; rho=.25/.5/.75,
+   full/short geometry và max12 calls; targets detached, independent
    re-noising noise. Không coi instantaneous F×d là finite shortcut.
 5. Exact64/16/16/32; accumulation mean, sync/clip/step và gradient ownership đúng;
    same FSDP collective call order khi rank-local active masks khác nhau.
+   Continuous P0/main durations cover actual child queries; rho được draw cùng
+   policy ở A/B và giữ nguyên qua5 replay updates/save-resume.
 6. k0..195 có40 successful F updates; cache replay5G; β≤.01 chỉ F trước freeze;
    main G không teacher/DMD calls; F optimizer và EMA không đổi sau freeze.
 7. λ tại200/300/700/1200 =1/.9/.5/0 nếu gate pass200; resume freeze/cache cursor không
@@ -1409,8 +1493,9 @@ static theo yêu cầu chủ project; không Torch imports, tests, training ho�
   Config context; experiment này không implement FD loss.
 - [Shortcut Models v3, §3](https://arxiv.org/html/2410.12557v3#S3),
   [official target code pinned](https://github.com/kvfrans/shortcut-models/blob/601004348667094e1b71f30942199759412d4432/targets_shortcut.py).
-  Binary composition/duration/self-bootstrap background; slow F bridge/LoRA fade
-  là thiết kế mới, không paper reproduction.
+  Binary composition/duration/self-bootstrap background. Random-splice composition,
+  continuous-duration distillation, slow F bridge/LoRA fade là thiết kế mới,
+  không paper reproduction.
 - [SD3.5 Medium official model card](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium),
   Diffusers0.33.1 [transformer](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/transformers/transformer_sd3.py),
   [attention](https://github.com/huggingface/diffusers/blob/v0.33.1/src/diffusers/models/attention.py),
@@ -1422,7 +1507,7 @@ static theo yêu cầu chủ project; không Torch imports, tests, training ho�
   kiểm tra mixed precision/input casting và EMA adapter query contract.
 - Human latest decisions override old handoff: G distills F; F instantaneous,
   warm-up, slow tracking, small teacher anchor, gradual LoRA fade; native512,
-  reLAION/global64, G5e-6/F2.5e-5/LoRA96/25%full, teacher50, independent new project.
+  reLAION/global64, G5e-6/F2.5e-5/LoRA96/25%full, random join, teacher50, independent new project.
 
 Bên nhận report source/config/checkpoint hashes; fresh smoke/resume/export evidence;
 P0/P1 gates; actual batch/VRAM/timing breakdown; kG/kF/λ/freeze event; F tracking;

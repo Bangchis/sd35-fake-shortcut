@@ -21,7 +21,10 @@ hướng dẫn runtime, gates, TensorBoard/logging, checkpoint/resume và matche
 | Precision | BF16 model forwards; FP32 master/moments/EMA/targets/CFG/Euler/loss |
 | Batch | `8 × 4 GPU × accum2 = 64`; profile `16 × 4 × 1` trước fork |
 | Phases | G teacher bootstrap300G → F warm200F → A/B300G mỗi arm |
-| A/B difference | Finite target: EMA-G self / local EMA-F bridge → EMA-G tail |
+| Random join | rho uniform `[0.25,0.75]`; prefix=rho×d, tail=(1-rho)×d; same A/B policy |
+| Duration training | 50% continuous random-short d in `[1/32,1)` từ P0; below-floor child dùng d0 |
+| Goal / checkpoint policy | One-step primary; few-step chất lượng tốt không thay thế one-step acceptance |
+| A/B difference | Prefix EMA-G / local EMA-F Euler; cùng EMA-G tail tới cuối đoạn |
 
 Main G không nhận loss teacher trực tiếp. F phải warm trên phân phối student và
 qua tracking gate trước. F base không copy từ G: **λ0 phải đúng T_CFG4.5**, nên
@@ -34,8 +37,11 @@ là evaluation chính; optional2/4/8-step chỉ diagnostic. Equal updates không
 compute: B có thêm F bridge calls. Báo matched held-out scores/paired CI và GPU-giờ;
 training loss riêng không chứng minh quality hoặc paper parity.
 
-Revision: `sd35_fake_shortcut_512_relaion_v3_slow_fake`. Không resume v2/older-draft
-states: F backbone/conditioning, losses, teacher grid, cadence và schedule đã đổi.
+Revision: `sd35_fake_shortcut_512_relaion_v4_random_splice`. Không exact-resume v3/v2/older training
+states. v4 thay fixed-half bằng random join và train continuous durations ngay P0;
+G không nhận split condition, chỉ `(x,sigma,d,c)`. Row-wise rho phải lưu trong target
+cache/resume; maxstep1/16,min2 và rho≤.75 ⇒ tối đa12 F bridge calls/row. Teacher/text
+caches có thể reuse khi hashes/policy khớp.
 Teacher cache dùng native50 sigma grid nhưng FP32 CFG/Euler accumulation; stock
 BF16 pipeline rounding khác, chưa claim bitwise sampler/paper parity.
 

@@ -13,6 +13,7 @@ và matched A/B evaluation. Bản code riêng để dễ đọc:
 |---|---|
 | Teacher | SD3.5 Medium base local Diffusers, frozen; CFG 4.5 |
 | Generator | Full-weight, finite-duration conditioning, inference 1 conditional NFE |
+| One-step priority | G teacher targets 50% full d=1; G shortcut targets 50% full d=1 |
 | Generator LR | `5e-6` |
 | Fake | Frozen G-after-bootstrap backbone + LoRA rank/alpha 96 + duration MLP |
 | Fake LR | `2.5e-5` |
@@ -23,6 +24,9 @@ và matched A/B evaluation. Bản code riêng để dễ đọc:
 | A/B difference | G shortcut target: EMA-G / EMA-F; các settings khác giống nhau |
 
 F phải warm-up theo samples của G và qua tracking gate trước khi làm target cho G.
+One-step là output và evaluation chính; DMD luôn nhận endpoint one-step G.
+Cùng checkpoint có thể sample2/4/8 steps để diagnostic, nhưng few-step tốt không
+thay thế yêu cầu1-step quality. Revision hiện tại: `v2_onestep`.
 300 updates là screening budget, chưa phải setting đã chứng minh convergence.
 So A/B bằng held-out image metrics với paired confidence interval; benchmark paper
 cần cùng prompts/resolution/evaluator. Training loss riêng không chứng minh chất lượng.

@@ -14,6 +14,12 @@ EMA-G-vs-EMA-F shortcut targets. Preserve native MMDiT/dual attention and physic
 sigma convention. Raw finite F is used for trajectories; affine correction is
 only defined for local F. Keep targets detached and optimizer ownership strict.
 
+One-step is the primary generation/evaluation/export contract. All DMD endpoints
+come from one_step. G teacher targets sample 50% full interval / 25% local /
+25% shorter finite intervals; G bootstrap targets sample 50% full interval.
+Optional 2/4/8-step sampling is diagnostic only. Do not accept few-step quality
+as evidence of one-step success; log and validate the one-step path explicitly.
+
 The initial artifact contains reference kernels, not a working distributed
 trainer. Implement the new sd35_shortcut package, runtime and metric adapters.
 reference/shortcut_core.py must match the main Python block in HANDOFF_VI.md.

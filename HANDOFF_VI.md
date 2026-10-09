@@ -1,6 +1,6 @@
 # SD3.5 Medium → 1-step: shortcut generator + student-tracking shortcut fake
 
-Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v1`.
+Ngày: 2026-10-09. Scientific ID: `sd35_fake_shortcut_512_relaion_v2_onestep`.
 
 Đây là **bản bàn giao thiết kế + code lõi để bên nhận triển khai**, theo yêu cầu mới
 của chủ repo. **Dự án mới độc lập `sd35-fake-shortcut`, package `sd35_shortcut`**:
@@ -43,6 +43,33 @@ tự tách hiệu quả riêng của beta. Nếu B có lợi, ablation kế ti�
 `beta=0`; không mở sweep nhiều chiều ngay từ đầu. So với checkpoint khởi tạo cũng
 được báo, nhưng không dùng riêng phép so đó để kết luận fake bridge hiệu quả.
 
+### 1.1 One-step là mục tiêu chính, few-step là khả năng phụ
+
+G phải hỗ trợ và được train trực tiếp để sinh ảnh bằng **1 conditional transformer
+evaluation**: `y_G=z-S_G(z, sigma=1, d=1, c)`. F warm-up/tracking và DMD luôn dùng
+endpoint one-step này. Không thay nó bằng endpoint2/4 steps trong training chính.
+
+G teacher bootstrap: tỷ lệ lấy mẫu kỳ vọng **50% full interval d=1**, 25% local
+d=0, 25% finite intervals ngắn hơn. Full teacher label chính là `z-y_teacher`,
+nên velocity MSE ởd=1 tương đương endpoint MSE của ảnh one-step trong latent space.
+Common teacher anchor của P2 giữ cùng phân phối này.
+
+G shortcut bootstrap P2: **50% full interval (sigma=1,d=1)**, 50% shorter dyadic
+intervals. Với full interval, input là fresh Gaussian noise; target gồm hai
+half-shortcuts d=1/2 từ EMA-G ởA hoặc EMA-F ởB. G chỉ chạy **một** full shortcut
+để khớp target hai bước đã detach. Không cần thêm differentiable forwards so với
+loss hiện có; đổi tỷ lệ sampling để ưu tiên output one-step.
+
+Inference2/4/8 steps dùng cùng G với d=1/N và sigma giảm1/N mỗi lần, không train
+một generator khác. Đây là diagnostic trên16 validation prompts; primary held-out
+test1024 images và paper-comparable export/eval dùng **1NFE**. Ảnh4 steps tốt mà
+1 step còn noise/collapse thì **chưa đạt mục tiêu**, phải ghi rõ và sửa/đào tạo tiếp.
+Cho phép gọi1 step không tự chứng minh1-step quality; gates/metrics phải đo nó.
+
+Revisionv2 đổi sampling và acceptance contract của G theo yêu cầu ưu tiên one-step;
+không đổi LR, batch, F warm-up/hierarchy hay nguồn target A/B. Cả hai nhánh phải
+được fork lại từ shared initialization của cùng revision/config, không trộn v1/v2.
+
 ## 2. Đã đọc setting FD-loss, nhưng không bê nguyên sang đây
 
 Nguồn: [Representation Fréchet Loss, Appendix B.4 / Table B.3](https://arxiv.org/html/2604.28190v1#A2.SS4).
@@ -82,7 +109,7 @@ schema hay package ở repo cũ. Đây là cấu hình đề xuất có lý do, 
 setting đã chạy thành công hoặc bảo đảm đủ để có ảnh một bước tốt.
 
 ```yaml
-scientific_id: sd35_fake_shortcut_512_relaion_v1
+scientific_id: sd35_fake_shortcut_512_relaion_v2_onestep
 backbone_path: /ABS/PATH/TO/SD35_MEDIUM_DIFFUSERS
 backbone_kind: sd35_medium_base
 local_files_only: true
@@ -111,6 +138,10 @@ teacher_cache_train_count: 512
 teacher_cache_validation_count: 128
 minimum_shortcut_duration: 0.03125  # 1/32, không phải một DDPM index
 student_external_cfg: 1.0
+primary_inference_steps: 1
+primary_evaluation_steps: 1
+diagnostic_inference_steps: [2, 4, 8]
+diagnostic_prompt_count: 16
 
 world_size: 4
 per_device_batch_size: 8
@@ -144,6 +175,9 @@ experiment_generator_updates: 300  # cho MỖI nhánh A/B
 fake_updates_per_generator: 1
 fake_bootstrap_fraction: 0.25
 g_auxiliary_batch_fraction: 0.25
+g_teacher_full_step_probability: 0.5
+g_teacher_local_probability: 0.25
+g_bootstrap_full_step_probability: 0.5
 g_teacher_trajectory_weight: 0.25
 g_shortcut_weight: 0.25
 g_dmd_weight: 1.0
@@ -301,15 +335,17 @@ không lấy CFG1 của FD-loss gán thành guidance teacher.
 
 Từ base pretrained T, tạo G độc lập và thêm embedding duration có zero output ở
 khởi tạo. Optimizer G mới. Train300 successful G updates bằng labels teacher cache:
-25% d=0, 25% d=1, 50% dyadic finite khác; chọn sigma đúng grid mỗi sample. T/F không
+kỳ vọng25% d=0, 50% d=1, 25% dyadic finite khác; chọn sigma đúng grid mỗi sample. T/F không
 train; P0 chưa dùng DMD hay cross-fake targets. Local teacher CFG và finite average
 velocity được học vào G conditional, nên inference không cần external CFG. EMA-G
 khởi tạo từ G và update từ FP32 shards sau từng successful G step trong P0.
 
-Validation cố định: endpoint MSE so teacher ở 1-step, endpoint errors ở 2/4/8 steps,
+Validation cố định: endpoint MSE so teacher ở 1-step trên128 prompts;
+endpoint errors ở2/4/8 steps chỉ trên16 validation prompts để giảm chi phí,
 ảnh 1-step/teacher, latent mean/std, số nonfinite, global grad norm và master delta.
 G phải có learning signal trên validation, không chỉ train loss. Nếu 300 updates
-vẫn không cải thiện endpoint error và ảnh còn noise/collapse, chưa chạy A/B. Dừng
+vẫn không cải thiện **1-step** endpoint error và ảnh1-step còn noise/collapse,
+chưa chạy A/B dù ảnhfew-step tốt. Dừng
 để debug dấu/sigma/duration/grad/conditioning hoặc calibration LR chung. Không
 chuyển sang DMD2/distilled checkpoint để che lỗi cold start.
 
@@ -370,10 +406,17 @@ L_G = L_DMD + 0.25*L_teacher_trajectory + 0.25*L_bootstrap
 L_DMD: sinh ảnh một bước từ fresh noise (giữ graph), re-noise tại sigma trong
 [0.02,0.98], direction detached từ frozen teacher CFG và corrected F local.
 L_teacher_trajectory: batch phụ bằng1/4 physical batch, lấy riêng từ cache512
-cùng conditioning đúng cache ids, giống P0. L_bootstrap: subset1/4 batch trên h_sigma re-noised từ current
+cùng conditioning đúng cache ids, giống P0 (50% full d=1).
+L_bootstrap: subset1/4 batch, 50% full(sigma=1,d=1) và50% shorter intervals,
+trên h_sigma re-noised từ current
 G endpoint; target bằng hai raw half-shortcuts của **EMA-G ở A / EMA-F ở B**.
 Target, midpoint và generated endpoint dùng làm input phụ đều detach. Chỉ G nhận
 gradient từ G loss; chỉ F nhận gradient từ F loss.
+
+G direct/DMD dùng **100% batch endpoints từ one-step G**. Teacher anchor và
+bootstrap ưu tiên full interval như trên; không chỉ train local/few-step rồi hy
+vọng G tự suy ra một bước. Các tỷ lệ là sampling probabilities, không bảo đảm
+đúng50% trong từng microbatch nhỏ; runtime log counts rồi aggregate qua ranks/windows.
 
 G direct dùng guided DMD trên một noisy state/time, không bê lịch 4 anchors SDXL.
 Ở one-step này dùng coupled direct estimator để giảm teacher calls; không claim
@@ -620,6 +663,21 @@ def one_step(model, noise, condition):
 
 
 @torch.no_grad()
+def sample_shortcuts(model, noise, condition, *, steps=1):
+    """Optional 2/4/8-step sampling; the primary output remains one_step."""
+    if steps not in (1, 2, 4, 8):
+        raise ValueError("Supported evaluation NFEs: 1, 2, 4, 8")
+    if steps == 1:
+        return one_step(model, noise, condition)
+    state = noise.float()
+    duration = 1.0 / steps
+    for index in range(steps):
+        velocity = model(state, 1.0 - index * duration, duration, condition)
+        state = state - duration * velocity
+    return state
+
+
+@torch.no_grad()
 def teacher_cfg(teacher, x, sigma, condition, negative, guidance):
     conditional = teacher(x, sigma, 0.0, condition)
     unconditional = teacher(x, sigma, 0.0, negative)
@@ -641,8 +699,19 @@ def teacher_rollout(teacher, noise, condition, negative, *, steps=32, guidance=4
     return torch.stack(states, dim=1)
 
 
-def draw_dyadic(count, device, generator, *, levels=5):
-    exponent = torch.randint(levels + 1, (count,), device=device, generator=generator)
+def draw_dyadic(count, device, generator, *, levels=5, full_step_probability=None):
+    if full_step_probability is None:
+        # F retains its uniform hierarchy, including d=1.
+        exponent = torch.randint(
+            levels + 1, (count,), device=device, generator=generator
+        )
+    else:
+        # Explicit G policy: full noise-to-clean, or a shorter finite interval.
+        exponent = torch.randint(
+            1, levels + 1, (count,), device=device, generator=generator
+        )
+        full = torch.rand(count, device=device, generator=generator)
+        exponent = torch.where(full < full_step_probability, 0, exponent)
     duration = 2.0 ** (-exponent.float())
     cells = 2**exponent
     slot = (torch.rand(count, device=device, generator=generator) * cells).long()
@@ -678,7 +747,9 @@ def local_rollout(model, x, sigma, duration, condition, *, steps=32):
     return state
 
 
-def cached_teacher_batch(states, generator):
+def cached_teacher_batch(
+    states, generator, *, full_step_probability=0.5, local_probability=0.25
+):
     """states [B,M+1,C,H,W], generated by teacher_rollout. Return x,sigma,d,target."""
     b, points = states.shape[:2]
     steps = points - 1
@@ -688,8 +759,10 @@ def cached_teacher_batch(states, generator):
     exponent = torch.randint(levels, (b,), device=states.device, generator=generator)
     span = 2**exponent
     kind = torch.rand(b, device=states.device, generator=generator)
-    full = kind < 0.25
-    local = (kind >= 0.25) & (kind < 0.5)
+    full = kind < full_step_probability
+    local = (kind >= full_step_probability) & (
+        kind < full_step_probability + local_probability
+    )
     span = torch.where(full, steps, torch.where(local, 1, span))
     slot = (
         torch.rand(b, device=states.device, generator=generator) * (steps // span)
@@ -809,6 +882,9 @@ def generator_losses(
     teacher_weight=0.25,
     shortcut_weight=0.25,
     dmd_weight=1.0,
+    teacher_full_step_probability=0.5,
+    teacher_local_probability=0.25,
+    bootstrap_full_step_probability=0.5,
 ):
     b = noise.shape[0]
     if b % 4:
@@ -825,11 +901,22 @@ def generator_losses(
     n = b // 4
     # Independent cached-anchor batch: do not restrict on-policy prompts to cache ids.
     # Runtime validates n rows and matching ids in teacher_states/teacher_condition.
-    tx, ts, td, target = cached_teacher_batch(teacher_states, generator)
+    tx, ts, td, target = cached_teacher_batch(
+        teacher_states,
+        generator,
+        full_step_probability=teacher_full_step_probability,
+        local_probability=teacher_local_probability,
+    )
     teacher_loss = 0.5 * F.mse_loss(g(tx, ts, td, teacher_condition), target)
 
     selection = slice(b - n, b)
-    bs, bd = draw_dyadic(n, noise.device, generator, levels=levels)
+    bs, bd = draw_dyadic(
+        n,
+        noise.device,
+        generator,
+        levels=levels,
+        full_step_probability=bootstrap_full_step_probability,
+    )
     by = generated[selection].detach()
     bx = (1 - coefficients(bs, by)) * by + coefficients(bs, by) * independent_noise[
         selection
@@ -852,6 +939,8 @@ def generator_losses(
         "dmd_direction_finite": torch.isfinite(direction).all(),
         "generated_mean": generated.detach().mean(),
         "generated_std": generated.detach().std(),
+        "teacher_full_step_fraction": (td == 1.0).float().mean().detach(),
+        "bootstrap_full_step_fraction": (bd == 1.0).float().mean().detach(),
     }
 
 
@@ -876,10 +965,16 @@ class FieldTask(nn.Module):
             return self.field(x, sigma, duration, condition)
         if operation == "g_warmup":
             x, sigma, duration, target = cached_teacher_batch(
-                kwargs["teacher_states"], kwargs["generator"]
+                kwargs["teacher_states"],
+                kwargs["generator"],
+                full_step_probability=kwargs.get("full_step_probability", 0.5),
+                local_probability=kwargs.get("local_probability", 0.25),
             )
             loss = 0.5 * F.mse_loss(self.field(x, sigma, duration, condition), target)
-            return loss, {"teacher_trajectory": loss.detach()}
+            return loss, {
+                "teacher_trajectory": loss.detach(),
+                "teacher_full_step_fraction": (duration == 1.0).float().mean(),
+            }
         if operation == "f_loss":
             return fake_loss(self.field, kwargs["training_batch"], condition)
         if operation == "g_loss":
@@ -1050,6 +1145,9 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
         teacher_condition=teacher_condition,  # independent cached-anchor ids
         generator=g_aux_rng,
         beta=beta,
+        teacher_full_step_probability=0.5,
+        teacher_local_probability=0.25,
+        bootstrap_full_step_probability=0.5,
     )
 ```
 
@@ -1112,6 +1210,13 @@ Noise cho re-noising
 F phải độc lập initial noise đã tạo y_G. DMD và bootstrap cùng dùng fresh on-policy
 G endpoints, không dùng teacher endpoint giả làm current generated sample.
 
+P0 gọi `G(operation="g_warmup", teacher_states=..., condition=teacher_condition,
+generator=..., full_step_probability=0.5, local_probability=0.25)`; P2 map config
+`g_teacher_*`/`g_bootstrap_*` tới keyword args tương ứng của `generator_losses`.
+Validate probabilities trong[0,1], full+local<=1 và dyadic levels>=1 trước collective
+forward; ghi actual full/local/short counts. F giữ uniform dyadic hierarchy;
+không truyền G full-step bias vào F sampler rồi làm lệch mục tiêu tracking đã chốt.
+
 Khóa A/B bằng một shared-init manifest và một config diff chỉ có source target và
 run directory/name. Cache/prompts/world-size/batch/precision/LR/checkpoint weight
 choice/optimizer initialization/EMA shadows đều phải bằng nhau. F sẽ khác giữa A/B
@@ -1126,6 +1231,12 @@ samples seen, LR, beta, target source và successful/skipped events. Ghi F local
 MSE, F shortcut MSE, held-out normalized errors theo sigma; G direct/teacher/shortcut
 losses, DMD-direction RMS, latent mean/std, full G global grad norm, F trainable
 grad norm, clip rate, số trainables và d/sigma histograms.
+
+Ghi riêng full-interval teacher/shortcut losses bằng sum/count qua ranks, cùng
+`teacher_full_step_fraction`/`bootstrap_full_step_fraction`; empty subset không
+được mean thành NaN rồi skip training. Đếm mọi differentiable G endpoint ởDMD là
+1NFE; log1/2/4/8-step diagnostic results ởtags khác nhau. Không gộp metric của nhiều
+NFEs thành một score hoặc tự chọn steps theo từng image để cải thiện kết quả.
 
 Master update diagnostics: RMS delta, relative delta norm và nonzero delta fraction
 cho G **FP32 master shards**, F LoRA và duration MLP; không log BF16 shadow delta rồi
@@ -1190,6 +1301,11 @@ không tự nhận duration embedding. Inference chỉ `one_step(G,z,c)` rồi V
 F/T không cần load. “One step” phải đo **1 conditional transformer evaluation**,
 không thêm unconditional CFG call, hidden F rollout hay nhiều G calls.
 
+Export metadata ghi `primary_inference_steps=1`, externalCFG1 và duration support.
+`sample_shortcuts(...,steps=2/4/8)` là sampler diagnostic tùy chọn của cùng model;
+1-step loader vẫn phải hoạt động độc lập. Reload kiểm tra1-step output/NFE thật,
+không chỉ kiểm tra một pipeline fallback nhiều bước.
+
 ## 12. Evaluation để biết có work và cách so paper
 
 Chốt primary metric **trước fork** dựa trên metric bên nhận đã có: default
@@ -1213,6 +1329,10 @@ cùng prompt ids/noise hashes,
 resize/crop/decoder/evaluator. Lưu per-sample primary + secondary scores, không chỉ
 mean. Noise test khác cache/probe/training. Validation128 dùng gates; final test
 không dùng tune beta/LR/loss weights/chọn milestone sau khi xem kết quả.
+
+Primary test và so A/B luôn **1NFE**; few-step dùng16 validation prompts chung,
+báo riêng2/4/8NFE và đúng cost. B4step>A1step không chứng minh B tốt hơn ởone-step.
+Không chọn final export chỉ vì few-step metric cao trong khi one-step thất bại.
 
 Điều kiện tín hiệu dương: B tốt hơn A trên primary **held-out image** metric với
 paired CI và không có degradation rõ trên secondary/ảnh uncurated; tracking F đạt
@@ -1324,6 +1444,11 @@ F frozen-base hash bất biến, chỉ adapter/duration đổi; EMA masters FP32
 đúng actor; accumulation batch64; all-rank skip không deadlock; FSDP G EMA shard
 layout đúng; strict resume/export/reload; A/B config diff chỉ source; metric id/seed
 pairing và prompt disjointness. Pure toy tests không thay H100 smoke thực tế.
+
+Kiểm tra G sampler fractions full/local/short, full interval luôn(sigma=1,d=1),
+full G teacher label luônnoise–teacher_clean, và gradient từ DMD đi qua one-step
+G graph. `sample_shortcuts(steps=1)` phải bằng `one_step` và gọi model1 lần;
+2/4/8 gọi đúngN lần cùng wrapper và d=1/N. Few-step pass không bỏ qua one-step gate.
 
 Smoke4GPU2–4 cycles có AdamW states allocated, checkpoint/resume cycle thật, d=1,
 beta>0 và cảEMA targets, rồi mới P0/P1/P2 thật. Kiểm tra generated noise seed,
